@@ -1,10 +1,16 @@
 package com.rdenno.jovial.ui
 
 import android.app.Activity
+import android.app.PictureInPictureParams
+import android.content.pm.PackageManager
 import android.graphics.Color as AndroidColor
 import android.os.Build
 import android.util.Base64
+import android.util.Rational
+import android.view.WindowManager
+import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
+import androidx.annotation.RequiresApi
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
@@ -42,12 +48,19 @@ import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
+import androidx.core.app.PictureInPictureModeChangedInfo
+import androidx.core.util.Consumer
 import androidx.core.view.WindowInsetsControllerCompat
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
 import androidx.media3.common.MediaItem
+import androidx.media3.common.Player
+import androidx.media3.common.VideoSize
 import androidx.media3.datasource.okhttp.OkHttpDataSource
 import androidx.media3.exoplayer.DefaultLoadControl
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
+import androidx.media3.session.MediaSession
 import androidx.media3.ui.PlayerView
 import coil.ImageLoader
 import coil.compose.AsyncImage
@@ -128,6 +141,93 @@ fun GanymedePlayerScreen(
         }
     }
 
+    // Media session gives the picture-in-picture window its play/pause controls.
+    // Declared after the effect above so it is disposed (released) before the player is.
+    DisposableEffect(exoPlayer) {
+        val session = MediaSession.Builder(context, exoPlayer).build()
+        onDispose { session.release() }
+    }
+
+    val activity = context as? ComponentActivity
+    val pipSupported = remember(activity) {
+        Build.VERSION.SDK_INT >= Build.VERSION_CODES.O &&
+            activity?.packageManager?.hasSystemFeature(PackageManager.FEATURE_PICTURE_IN_PICTURE) == true
+    }
+    var isPlaying by remember { mutableStateOf(false) }
+    var isInPip by remember { mutableStateOf(activity?.isInPictureInPictureMode == true) }
+    var videoAspect by remember { mutableStateOf(Rational(16, 9)) }
+
+    DisposableEffect(exoPlayer) {
+        val listener = object : Player.Listener {
+            override fun onIsPlayingChanged(playing: Boolean) {
+                isPlaying = playing
+            }
+
+            override fun onVideoSizeChanged(videoSize: VideoSize) {
+                if (videoSize.width > 0 && videoSize.height > 0) {
+                    // Android rejects PiP aspect ratios outside 1:2.39 .. 2.39:1
+                    val ratio = (videoSize.width * videoSize.pixelWidthHeightRatio / videoSize.height)
+                        .coerceIn(1f / 2.39f, 2.39f)
+                    videoAspect = Rational((ratio * 10_000).toInt(), 10_000)
+                }
+            }
+        }
+        exoPlayer.addListener(listener)
+        onDispose { exoPlayer.removeListener(listener) }
+    }
+
+    // Keep the screen awake while the video is playing, like YouTube
+    DisposableEffect(isPlaying) {
+        if (isPlaying) {
+            window?.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        } else {
+            window?.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        }
+        onDispose { window?.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON) }
+    }
+
+    // Android 12+: the system enters PiP on its own when leaving the app while this is enabled
+    LaunchedEffect(isPlaying, videoAspect, pipSupported) {
+        if (pipSupported && Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            activity?.setPictureInPictureParams(buildPipParams(videoAspect, autoEnter = isPlaying))
+        }
+    }
+
+    DisposableEffect(activity, pipSupported) {
+        if (activity == null) return@DisposableEffect onDispose { }
+
+        // Android 8-11 has no auto-enter, so enter PiP manually when the user leaves the app
+        val userLeaveListener = Runnable {
+            if (pipSupported && Build.VERSION.SDK_INT >= Build.VERSION_CODES.O &&
+                Build.VERSION.SDK_INT < Build.VERSION_CODES.S && exoPlayer.isPlaying
+            ) {
+                activity.enterPictureInPictureMode(buildPipParams(videoAspect, autoEnter = false))
+            }
+        }
+        val pipModeListener = Consumer<PictureInPictureModeChangedInfo> { info ->
+            isInPip = info.isInPictureInPictureMode
+        }
+        // Closing the PiP window (or leaving without PiP) stops the activity: pause playback
+        val lifecycleObserver = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_STOP) {
+                exoPlayer.pause()
+            }
+        }
+        activity.addOnUserLeaveHintListener(userLeaveListener)
+        activity.addOnPictureInPictureModeChangedListener(pipModeListener)
+        activity.lifecycle.addObserver(lifecycleObserver)
+
+        onDispose {
+            activity.removeOnUserLeaveHintListener(userLeaveListener)
+            activity.removeOnPictureInPictureModeChangedListener(pipModeListener)
+            activity.lifecycle.removeObserver(lifecycleObserver)
+            // Leaving the player must not auto-enter PiP from the VOD list
+            if (pipSupported && Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                activity.setPictureInPictureParams(buildPipParams(videoAspect, autoEnter = false))
+            }
+        }
+    }
+
     fun handleBack() {
         viewModel.savePlaybackPosition(vod.id, exoPlayer.currentPosition)
         onBack()
@@ -177,6 +277,17 @@ fun GanymedePlayerScreen(
             }
             delay(500L)
         }
+    }
+
+    // The PiP window shows only the video, without chat or controls
+    if (isInPip) {
+        VideoSurface(
+            exoPlayer = exoPlayer,
+            onControlsVisibilityChanged = { },
+            showControls = false,
+            modifier = Modifier.fillMaxSize().background(Color.Black)
+        )
+        return
     }
 
     Box(modifier = Modifier.fillMaxSize().background(Color.Black)) {
@@ -347,23 +458,35 @@ fun GanymedePlayerScreen(
     }
 }
 
+@RequiresApi(Build.VERSION_CODES.O)
+private fun buildPipParams(aspectRatio: Rational, autoEnter: Boolean): PictureInPictureParams {
+    val builder = PictureInPictureParams.Builder().setAspectRatio(aspectRatio)
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+        builder.setAutoEnterEnabled(autoEnter)
+    }
+    return builder.build()
+}
+
 @Composable
 fun VideoSurface(
     exoPlayer: ExoPlayer,
     onControlsVisibilityChanged: (Boolean) -> Unit,
-    modifier: Modifier = Modifier
+    modifier: Modifier = Modifier,
+    showControls: Boolean = true
 ) {
     AndroidView(
         factory = { ctx ->
             PlayerView(ctx).apply {
                 player = exoPlayer
-                useController = true
                 setShowBuffering(PlayerView.SHOW_BUFFERING_ALWAYS)
                 setControllerVisibilityListener(PlayerView.ControllerVisibilityListener { visibility ->
                     onControlsVisibilityChanged(visibility == android.view.View.VISIBLE)
                 })
             }
         },
+        update = { view -> view.useController = showControls },
+        // Entering/leaving PiP swaps in a new PlayerView; detach the old one from the player
+        onRelease = { view -> view.player = null },
         modifier = modifier
     )
 }
