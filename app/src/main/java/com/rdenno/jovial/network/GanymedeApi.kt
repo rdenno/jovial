@@ -6,6 +6,9 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.withContext
+import okhttp3.Cache
+import okhttp3.HttpUrl
+import okhttp3.Interceptor
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import org.json.JSONArray
@@ -15,6 +18,7 @@ import retrofit2.converter.gson.GsonConverterFactory
 import retrofit2.http.GET
 import retrofit2.http.Path
 import retrofit2.http.Query
+import java.io.File
 import java.util.concurrent.TimeUnit
 
 // --- Standard Ganymede API Wrapper ---
@@ -201,6 +205,34 @@ interface GanymedeApi {
     ): GanymedeResponse<Long>
 
     companion object {
+        /** App cache directory; set before connecting so emote catalogs can be cached on disk. */
+        var cacheDir: File? = null
+
+        private var httpCache: Cache? = null
+
+        /** One shared OkHttp disk cache for every client (OkHttp allows one Cache per directory). */
+        fun sharedCache(): Cache? {
+            val dir = cacheDir ?: return null
+            return httpCache ?: Cache(File(dir, "http"), 300L * 1024 * 1024).also { httpCache = it }
+        }
+
+        /**
+         * Ganymede and the emote APIs send no cache headers, so OkHttp would never cache them.
+         * Forces caching of matching responses; Ganymede's emote catalog embeds every image as
+         * base64 and can be tens of MB, so re-downloading it on every video open is slow.
+         */
+        fun forceCacheInterceptor(maxAgeSeconds: Int, matches: (HttpUrl) -> Boolean) = Interceptor { chain ->
+            val response = chain.proceed(chain.request())
+            if (response.isSuccessful && matches(chain.request().url)) {
+                response.newBuilder()
+                    .removeHeader("Pragma")
+                    .header("Cache-Control", "public, max-age=$maxAgeSeconds")
+                    .build()
+            } else {
+                response
+            }
+        }
+
         var activeClient: OkHttpClient = OkHttpClient.Builder()
             .connectTimeout(10, TimeUnit.SECONDS)
             .readTimeout(20, TimeUnit.SECONDS)
@@ -229,6 +261,10 @@ interface GanymedeApi {
                 .followRedirects(true)
                 .followSslRedirects(true)
                 .connectionPool(okhttp3.ConnectionPool(8, 5, TimeUnit.MINUTES))
+                .cache(sharedCache())
+                .addNetworkInterceptor(forceCacheInterceptor(7 * 24 * 3600) { url ->
+                    url.encodedPath.endsWith("/chat/emotes")
+                })
                 .apply {
                     if (!apiKey.isNullOrBlank()) {
                         addInterceptor { chain ->
@@ -258,10 +294,15 @@ interface GanymedeApi {
  * or when Ganymede's Twitch credentials are not configured.
  */
 object ThirdPartyEmoteFetcher {
-    private val httpClient = OkHttpClient.Builder()
-        .connectTimeout(10, TimeUnit.SECONDS)
-        .readTimeout(15, TimeUnit.SECONDS)
-        .build()
+    // Lazy so the shared disk cache is configured before the client is built
+    private val httpClient by lazy {
+        OkHttpClient.Builder()
+            .connectTimeout(10, TimeUnit.SECONDS)
+            .readTimeout(15, TimeUnit.SECONDS)
+            .cache(GanymedeApi.sharedCache())
+            .addNetworkInterceptor(GanymedeApi.forceCacheInterceptor(24 * 3600) { true })
+            .build()
+    }
 
     suspend fun fetchAllThirdPartyEmotes(twitchChannelId: String?): List<GanymedeEmote> =
         withContext(Dispatchers.IO) {

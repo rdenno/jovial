@@ -14,7 +14,14 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import java.io.File
 import kotlin.math.abs
+
+// Chat is fetched this far ahead of playback, then revealed as the video reaches each message
+private const val CHAT_FETCH_WINDOW_SECONDS = 30.0
+// Fetch the next window once fewer than this many seconds of chat remain buffered
+private const val CHAT_PREFETCH_MARGIN_SECONDS = 15.0
+private const val MAX_VISIBLE_CHAT = 150
 
 enum class ChatDisplayMode {
     HIDDEN,
@@ -74,10 +81,19 @@ class PlayerViewModel : ViewModel() {
 
     private var lastSyncedSecond: Double = -1.0
     private var chatJob: Job? = null
+    private var prefetchJob: Job? = null
     private var emoteJob: Job? = null
 
-    fun initPreferences(prefs: android.content.SharedPreferences) {
+    // Fetched comments sorted by offset, including ones playback has not reached yet
+    private var chatBuffer: List<ChatComment> = emptyList()
+    // Chat is loaded up to this playback second; negative while a seek fetch is in flight
+    private var bufferedUntil: Double = -1.0
+    // Bumped on every seek/reset so responses for an old position are discarded
+    private var chatGeneration = 0
+
+    fun initPreferences(prefs: android.content.SharedPreferences, cacheDir: File) {
         sharedPrefs = prefs
+        GanymedeApi.cacheDir = cacheDir
         loadAllSavedProgress()
     }
 
@@ -195,11 +211,14 @@ class PlayerViewModel : ViewModel() {
         _emoteCatalog.value = EmoteCatalog()
 
         emoteJob = viewModelScope.launch {
-            val byName = LinkedHashMap<String, GanymedeEmote>()
-            val byId = LinkedHashMap<String, GanymedeEmote>()
+            var serverEmotes = emptyList<GanymedeEmote>()
+            var thirdPartyEmotes = emptyList<GanymedeEmote>()
 
-            fun mergeEmotes(list: List<GanymedeEmote>) {
-                for (emote in list) {
+            // Third-party emotes take precedence over server emotes with the same name or ID
+            fun publishCatalog() {
+                val byName = HashMap<String, GanymedeEmote>()
+                val byId = HashMap<String, GanymedeEmote>()
+                for (emote in serverEmotes + thirdPartyEmotes) {
                     if (emote.id.isNotBlank()) {
                         byId[emote.id] = emote
                     }
@@ -207,40 +226,33 @@ class PlayerViewModel : ViewModel() {
                         byName[emote.name] = emote
                     }
                 }
-                _emoteCatalog.value = EmoteCatalog(
-                    byName = HashMap(byName),
-                    byId = HashMap(byId)
-                )
+                _emoteCatalog.value = EmoteCatalog(byName = byName, byId = byId)
             }
 
-            val serverEmotesDeferred = async {
-                runCatching { currentApi.getChatEmotes(vod.id).data.orEmpty() }
+            // Fetch both sources concurrently: the server catalog embeds every image as base64 and
+            // can be tens of MB, so it must not hold up the small 7TV / BTTV / FFZ lists
+            launch {
+                serverEmotes = runCatching { currentApi.getChatEmotes(vod.id).data.orEmpty() }
                     .getOrDefault(emptyList())
+                if (serverEmotes.isNotEmpty()) {
+                    publishCatalog()
+                }
             }
 
-            val twitchChannelIdDeferred = async {
-                vod.edges?.channel?.extId?.takeIf { it.isNotBlank() }
+            launch {
+                val channelTwitchId = vod.edges?.channel?.extId?.takeIf { it.isNotBlank() }
                     ?: runCatching { currentApi.getChatUserId(vod.id).data?.toString() }.getOrNull()
-            }
-
-            // Merge server emotes as soon as available
-            val serverEmotes = serverEmotesDeferred.await()
-            if (serverEmotes.isNotEmpty()) {
-                mergeEmotes(serverEmotes)
-            }
-
-            // Fetch 7TV, BTTV, and FFZ global + channel emotes
-            val channelTwitchId = twitchChannelIdDeferred.await()
-            val thirdPartyEmotes = ThirdPartyEmoteFetcher.fetchAllThirdPartyEmotes(channelTwitchId)
-            if (thirdPartyEmotes.isNotEmpty()) {
-                mergeEmotes(thirdPartyEmotes)
+                thirdPartyEmotes = ThirdPartyEmoteFetcher.fetchAllThirdPartyEmotes(channelTwitchId)
+                if (thirdPartyEmotes.isNotEmpty()) {
+                    publishCatalog()
+                }
             }
         }
     }
 
     /**
      * Called with the ExoPlayer's current playback timestamp in seconds.
-     * Automatically detects scrubbing/seeking vs normal playback and loads chat rapidly.
+     * Chat is fetched ahead into a buffer and only shown once playback reaches each message.
      */
     fun onPlaybackPositionUpdate(vodId: String, currentSeconds: Double) {
         if (_layoutConfig.value.displayMode == ChatDisplayMode.HIDDEN) return
@@ -250,55 +262,83 @@ class PlayerViewModel : ViewModel() {
         if (lastSyncedSecond < 0 || abs(currentSeconds - lastSyncedSecond) > 3.0) {
             lastSyncedSecond = currentSeconds
             chatJob?.cancel()
+            prefetchJob?.cancel()
+            val generation = ++chatGeneration
+            chatBuffer = emptyList()
+            bufferedUntil = -1.0
+            val windowEnd = currentSeconds + CHAT_FETCH_WINDOW_SECONDS
+
             chatJob = viewModelScope.launch {
                 val comments = if (currentSeconds <= 5.0) {
                     // Initial stream playback: Ganymede /chat/seek?start=0 returns empty list because it searches backwards before 0s!
-                    // Instead, fetch comments from 0 to 25 seconds ahead so chat is populated immediately!
+                    // Instead, fetch comments from 0 to the window end so chat is populated immediately!
                     runCatching {
-                        currentApi.getChatRange(vodId, 0.0, 25.0).data.orEmpty()
+                        currentApi.getChatRange(vodId, 0.0, windowEnd).data.orEmpty()
                     }.getOrDefault(emptyList())
                 } else {
-                    // Mid-stream seek: fetch comments right before seek AND a 15-second window ahead
+                    // Mid-stream seek: fetch comments right before seek AND a window ahead
                     val beforeDeferred = async {
                         runCatching { currentApi.getSeekChat(vodId, currentSeconds, count = 35).data.orEmpty() }.getOrDefault(emptyList())
                     }
                     val afterDeferred = async {
-                        runCatching { currentApi.getChatRange(vodId, currentSeconds, currentSeconds + 15.0).data.orEmpty() }.getOrDefault(emptyList())
+                        runCatching { currentApi.getChatRange(vodId, currentSeconds, windowEnd).data.orEmpty() }.getOrDefault(emptyList())
                     }
-                    (beforeDeferred.await() + afterDeferred.await()).distinctBy { it.id }
+                    beforeDeferred.await() + afterDeferred.await()
                 }
-                if (comments.isNotEmpty()) {
-                    _chatMessages.value = comments.sortedBy { it.offsetSeconds }
-                }
+                if (generation != chatGeneration) return@launch
+                chatBuffer = comments.distinctBy { it.id }.sortedBy { it.offsetSeconds }
+                bufferedUntil = windowEnd
+                revealChat(lastSyncedSecond)
             }
             return
         }
 
-        // Normal forward playback: fetch window [lastSyncedSecond, currentSeconds]
-        if (currentSeconds > lastSyncedSecond) {
-            val start = lastSyncedSecond
-            val end = currentSeconds
-            lastSyncedSecond = currentSeconds
+        lastSyncedSecond = currentSeconds
+        revealChat(currentSeconds)
 
-            viewModelScope.launch {
+        // Normal forward playback: top up the buffer before it runs dry
+        val start = bufferedUntil
+        if (start >= 0 && start - currentSeconds < CHAT_PREFETCH_MARGIN_SECONDS && prefetchJob?.isActive != true) {
+            val end = start + CHAT_FETCH_WINDOW_SECONDS
+            val generation = chatGeneration
+            prefetchJob = viewModelScope.launch {
+                // On failure bufferedUntil is unchanged, so the next tick retries
                 runCatching {
                     currentApi.getChatRange(vodId, start, end).data.orEmpty()
                 }.onSuccess { newComments ->
-                    if (newComments.isNotEmpty()) {
-                        _chatMessages.update { existing ->
-                            (existing + newComments)
-                                .distinctBy { it.id }
-                                .takeLast(150) // Keep memory footprint tiny
-                        }
-                    }
+                    if (generation != chatGeneration) return@onSuccess
+                    chatBuffer = (chatBuffer + newComments)
+                        .distinctBy { it.id }
+                        .sortedBy { it.offsetSeconds }
+                    bufferedUntil = end
                 }
             }
         }
     }
 
+    /** Publishes the buffered comments that playback has reached. */
+    private fun revealChat(currentSeconds: Double) {
+        var revealedCount = chatBuffer.indexOfFirst { it.offsetSeconds > currentSeconds }
+            .let { if (it < 0) chatBuffer.size else it }
+        // Drop revealed messages beyond the display limit to keep memory footprint tiny
+        if (revealedCount > MAX_VISIBLE_CHAT) {
+            chatBuffer = chatBuffer.drop(revealedCount - MAX_VISIBLE_CHAT)
+            revealedCount = MAX_VISIBLE_CHAT
+        }
+        val visible = chatBuffer.subList(0, revealedCount)
+        val shown = _chatMessages.value
+        if (visible.size != shown.size || visible.lastOrNull()?.id != shown.lastOrNull()?.id) {
+            _chatMessages.value = visible.toList()
+        }
+    }
+
     fun resetChatState() {
         chatJob?.cancel()
+        prefetchJob?.cancel()
         emoteJob?.cancel()
+        chatGeneration++
+        chatBuffer = emptyList()
+        bufferedUntil = -1.0
         lastSyncedSecond = -1.0
         _chatMessages.value = emptyList()
         _emoteCatalog.value = EmoteCatalog()

@@ -62,7 +62,7 @@ fun JovialApp(viewModel: PlayerViewModel = viewModel()) {
     val prefs = remember { context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE) }
 
     LaunchedEffect(Unit) {
-        viewModel.initPreferences(prefs)
+        viewModel.initPreferences(prefs, context.cacheDir)
     }
 
     var selectedVod by remember { mutableStateOf<GanymedeVod?>(null) }
