@@ -1,0 +1,703 @@
+Here is a complete, lightweight native Android client architecture for Ganymede built with Kotlin, Jetpack Compose, and Media3 (ExoPlayer).It connects directly to Ganymede's /api/v1 REST API, streams your raw or rendered .mp4 archives, and synchronizes live interactive chat (/api/v1/vod/{id}/chat) with a real-time customizable layout HUD.Features Included5 Chat Display Modes:Side-by-Side (Left or Right): Splits the screen between video and live-synced chat with one-tap side swapping.Transparent Overlay (Left or Right): Fullscreen video with a semi-transparent chat box floating on either edge.Hidden: Fullscreen video with chat polling paused to save battery/bandwidth.Adjustable Layout Proportions: Real-time slider to change the chat panel width (20% to 45%), overlay opacity, and chat font size.Stream Source Toggle: Easily switch between the raw video stream (video_path + live JSON chat) or Ganymede's pre-rendered chat video (chat_video_path -chat.mp4) if you prefer burned-in chat.Live Chat Polling & Sync: Polls Ganymede's /chat/seek and windowed /chat?start=&end= endpoints tied directly to ExoPlayer's currentPosition clock, automatically handling scrubbing and seeks.1. Project Dependencies (app/build.gradle.kts)Create a new Empty Activity (Jetpack Compose) project in Android Studio and add the following dependencies:Kotlindependencies {
+    // Jetpack Compose & Material 3
+    implementation(platform("androidx.compose:compose-bom:2025.02.00"))
+    implementation("androidx.compose.ui:ui")
+    implementation("androidx.compose.material3:material3")
+    implementation("androidx.compose.material:material-icons-extended")
+    implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.8.7")
+
+    // Media3 (ExoPlayer) for low-overhead hardware video decoding
+    val media3Version = "1.5.1"
+    implementation("androidx.media3:media3-exoplayer:$media3Version")
+    implementation("androidx.media3:media3-ui:$media3Version")
+
+    // Retrofit + Kotlin Serialization for Ganymede REST API
+    implementation("com.squareup.retrofit2:retrofit:2.11.0")
+    implementation("com.squareup.retrofit2:converter-gson:2.11.0")
+    implementation("com.squareup.okhttp3:okhttp:4.12.0")
+
+    // Coil for VOD & Channel thumbnails
+    implementation("io.coil-kt:coil-compose:2.7.0")
+}
+(Don't forget to add <uses-permission android:name="android.permission.INTERNET" /> and android:usesCleartextTraffic="true" in AndroidManifest.xml if accessing Ganymede over local HTTP).2. Data Models & Ganymede API (GanymedeApi.kt)Ganymede exposes VOD lists, static media paths, and time-windowed chat comments under /api/v1. You can authenticate using an API Key generated in Ganymede Admin > API Keys (X-API-Key header) or unauthenticated if your instance allows public read access.   Kotlinpackage com.example.ganymedeclient.network
+
+import com.google.gson.annotations.SerializedName
+import okhttp3.OkHttpClient
+import retrofit2.Retrofit
+import retrofit2.converter.gson.GsonConverterFactory
+import retrofit2.http.GET
+import retrofit2.http.Path
+import retrofit2.http.Query
+
+// --- Models ---
+
+data class VodPaginationResponse(
+    val data: List<GanymedeVod> = emptyList()
+)
+
+data class GanymedeVod(
+    val id: String,
+    val title: String,
+    val duration: Int,
+    @SerializedName("streamed_at") val streamedAt: String,
+    @SerializedName("web_thumbnail_path") val thumbnailPath: String,
+    @SerializedName("video_path") val videoPath: String,
+    @SerializedName("chat_video_path") val chatVideoPath: String?,
+    @SerializedName("chat_path") val chatPath: String?,
+    val edges: VodEdges?
+) {
+    fun getFullVideoUrl(baseUrl: String, useRenderedChatVideo: Boolean): String {
+        val path = if (useRenderedChatVideo && !chatVideoPath.isNullOrBlank()) {
+            chatVideoPath
+        } else {
+            videoPath
+        }
+        return "${baseUrl.trimEnd('/')}$path"
+    }
+
+    fun getFullThumbnailUrl(baseUrl: String): String =
+        "${baseUrl.trimEnd('/')}$thumbnailPath"
+}
+
+data class VodEdges(val channel: GanymedeChannel?)
+data class GanymedeChannel(@SerializedName("display_name") val displayName: String)
+
+// Represents the standard TwitchDownloader / Ganymede chat comment schema
+data class ChatComment(
+    @SerializedName("_id") val id: String,
+    @SerializedName("content_offset_seconds") val offsetSeconds: Double,
+    val commenter: Commenter,
+    val message: ChatMessage
+)
+
+data class Commenter(
+    @SerializedName("display_name") val displayName: String
+)
+
+data class ChatMessage(
+    val body: String,
+    @SerializedName("user_color") val userColor: String?
+)
+
+// --- Retrofit Interface ---
+
+interface GanymedeApi {
+    @GET("/api/v1/vod/pagination")
+    suspend fun getVods(
+        @Query("limit") limit: Int = 50,
+        @Query("offset") offset: Int = 0
+    ): VodPaginationResponse
+
+    // Fetches initial messages right before a seek timestamp
+    @GET("/api/v1/vod/{id}/chat/seek")
+    suspend fun getSeekChat(
+        @Path("id") vodId: String,
+        @Query("time") timeSeconds: Double,
+        @Query("count") count: Int = 30
+    ): List<ChatComment>
+
+    // Fetches chat comments between [start, end] seconds
+    @GET("/api/v1/vod/{id}/chat")
+    suspend fun getChatRange(
+        @Path("id") vodId: String,
+        @Query("start") startSeconds: Double,
+        @Query("end") endSeconds: Double
+    ): List<ChatComment>
+
+    companion object {
+        fun create(baseUrl: String, apiKey: String? = null): GanymedeApi {
+            val client = OkHttpClient.Builder().apply {
+                if (!apiKey.isNullOrBlank()) {
+                    addInterceptor { chain ->
+                        val req = chain.request().newBuilder()
+                            .addHeader("X-API-Key", apiKey)
+                            .build()
+                        chain.proceed(req)
+                    }
+                }
+            }.build()
+
+            return Retrofit.Builder()
+                .baseUrl(baseUrl.trimEnd('/') + "/")
+                .client(client)
+                .addConverterFactory(GsonConverterFactory.create())
+                .build()
+                .create(GanymedeApi::class.java)
+        }
+    }
+}
+3. Customizable UI State & Chat Sync Engine (PlayerViewModel.kt)This ViewModel manages the customizable player settings (chat side, mode, width ratio, opacity) and runs a coroutine loop that syncs chat messages with the video player clock.Kotlinpackage com.example.ganymedeclient.ui
+
+import androidx.lifecycle.ViewModel
+import androidx.lifecycle.viewModelScope
+import com.example.ganymedeclient.network.ChatComment
+import com.example.ganymedeclient.network.GanymedeApi
+import com.example.ganymedeclient.network.GanymedeVod
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.launch
+import kotlin.math.abs
+
+enum class ChatDisplayMode {
+    HIDDEN,
+    SIDE_BY_SIDE,
+    OVERLAY
+}
+
+enum class ChatSide {
+    LEFT,
+    RIGHT
+}
+
+data class PlayerLayoutConfig(
+    val displayMode: ChatDisplayMode = ChatDisplayMode.SIDE_BY_SIDE,
+    val chatSide: ChatSide = ChatSide.RIGHT,
+    val chatWidthFraction: Float = 0.28f, // 20% to 45% of screen width
+    val overlayOpacity: Float = 0.55f,    // Background alpha in Overlay mode
+    val fontSizeSp: Float = 13f,
+    val useRenderedChatVideo: Boolean = false
+)
+
+class PlayerViewModel : ViewModel() {
+    private var api: GanymedeApi? = null
+    var serverUrl: String = "http://192.168.1.100:4000"
+        private set
+
+    private val _vods = MutableStateFlow<List<GanymedeVod>>(emptyList())
+    val vods: StateFlow<List<GanymedeVod>> = _vods.asStateFlow()
+
+    private val _layoutConfig = MutableStateFlow(PlayerLayoutConfig())
+    val layoutConfig: StateFlow<PlayerLayoutConfig> = _layoutConfig.asStateFlow()
+
+    private val _chatMessages = MutableStateFlow<List<ChatComment>>(emptyList())
+    val chatMessages: StateFlow<List<ChatComment>> = _chatMessages.asStateFlow()
+
+    private var lastSyncedSecond: Double = -1.0
+    private var chatJob: Job? = null
+
+    fun connectToServer(url: String, apiKey: String?) {
+        serverUrl = url.trimEnd('/')
+        api = GanymedeApi.create(serverUrl, apiKey)
+        fetchVods()
+    }
+
+    fun fetchVods() {
+        val currentApi = api ?: return
+        viewModelScope.launch {
+            runCatching { currentApi.getVods() }
+                .onSuccess { _vods.value = it.data }
+        }
+    }
+
+    fun updateLayout(transform: (PlayerLayoutConfig) -> PlayerLayoutConfig) {
+        _layoutConfig.update(transform)
+    }
+
+    /**
+     * Called every 500ms with the ExoPlayer's current playback timestamp in seconds.
+     * Automatically detects scrubbing/seeking vs normal playback.
+     */
+    fun onPlaybackPositionUpdate(vodId: String, currentSeconds: Double) {
+        if (_layoutConfig.value.displayMode == ChatDisplayMode.HIDDEN) return
+        val currentApi = api ?: return
+
+        // Detect seek (jump > 4 seconds backward or forward)
+        if (lastSyncedSecond < 0 || abs(currentSeconds - lastSyncedSecond) > 4.0) {
+            lastSyncedSecond = currentSeconds
+            chatJob?.cancel()
+            chatJob = viewModelScope.launch {
+                runCatching {
+                    currentApi.getSeekChat(vodId, currentSeconds, count = 40)
+                }.onSuccess { initialBatch ->
+                    _chatMessages.value = initialBatch
+                }
+            }
+            return
+        }
+
+        // Normal forward playback: fetch window [lastSyncedSecond, currentSeconds]
+        if (currentSeconds > lastSyncedSecond) {
+            val start = lastSyncedSecond
+            val end = currentSeconds
+            lastSyncedSecond = currentSeconds
+
+            viewModelScope.launch {
+                runCatching {
+                    currentApi.getChatRange(vodId, start, end)
+                }.onSuccess { newComments ->
+                    if (newComments.isNotEmpty()) {
+                        _chatMessages.update { existing ->
+                            (existing + newComments)
+                                .distinctBy { it.id }
+                                .takeLast(150) // Keep memory footprint tiny
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fun resetChatState() {
+        lastSyncedSecond = -1.0
+        _chatMessages.value = emptyList()
+    }
+}
+4. Customizable Player & Chat UI (GanymedePlayerScreen.kt)This file implements the adaptive layout container. You can flip ChatSide.LEFT and ChatSide.RIGHT, switch between SIDE_BY_SIDE, OVERLAY, and HIDDEN, and adjust the width slider live while watching.Kotlinpackage com.example.ganymedeclient.ui
+
+import android.graphics.Color as AndroidColor
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.foundation.background
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.ArrowBack
+import androidx.compose.material.icons.filled.SwapHoriz
+import androidx.compose.material.icons.filled.Tune
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.SpanStyle
+import androidx.compose.ui.text.buildAnnotatedString
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.withStyle
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import androidx.compose.ui.viewinterop.AndroidView
+import androidx.media3.common.MediaItem
+import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.ui.PlayerView
+import com.example.ganymedeclient.network.ChatComment
+import com.example.ganymedeclient.network.GanymedeVod
+import kotlinx.coroutines.delay
+
+@Composable
+fun GanymedePlayerScreen(
+    vod: GanymedeVod,
+    viewModel: PlayerViewModel,
+    onBack: () -> Unit
+) {
+    val context = LocalContext.current
+    val config by viewModel.layoutConfig.collectAsState()
+    val messages by viewModel.chatMessages.collectAsState()
+    var showSettingsSheet by remember { mutableStateOf(false) }
+
+    // Initialize ExoPlayer
+    val exoPlayer = remember {
+        ExoPlayer.Builder(context).build()
+    }
+
+    // Load MediaItem when VOD or video source preference (Raw vs Rendered Chat MP4) changes
+    LaunchedEffect(vod.id, config.useRenderedChatVideo) {
+        val currentPos = exoPlayer.currentPosition
+        val videoUrl = vod.getFullVideoUrl(viewModel.serverUrl, config.useRenderedChatVideo)
+        exoPlayer.setMediaItem(MediaItem.fromUri(videoUrl), currentPos)
+        exoPlayer.prepare()
+        exoPlayer.playWhenReady = true
+    }
+
+    // Poll ExoPlayer position every 500ms to sync chat
+    LaunchedEffect(vod.id, config.displayMode) {
+        while (true) {
+            if (exoPlayer.isPlaying) {
+                val currentSec = exoPlayer.currentPosition / 1000.0
+                viewModel.onPlaybackPositionUpdate(vod.id, currentSec)
+            }
+            delay(500L)
+        }
+    }
+
+    DisposableEffect(Unit) {
+        onDispose {
+            viewModel.resetChatState()
+            exoPlayer.release()
+        }
+    }
+
+    Box(modifier = Modifier.fillMaxSize().background(Color.Black)) {
+        when (config.displayMode) {
+            ChatDisplayMode.HIDDEN -> {
+                VideoSurface(exoPlayer, Modifier.fillMaxSize())
+            }
+
+            ChatDisplayMode.SIDE_BY_SIDE -> {
+                Row(modifier = Modifier.fillMaxSize()) {
+                    if (config.chatSide == ChatSide.LEFT) {
+                        ChatPane(
+                            messages = messages,
+                            fontSizeSp = config.fontSizeSp,
+                            modifier = Modifier
+                                .fillMaxHeight()
+                                .fillMaxWidth(config.chatWidthFraction)
+                                .background(Color(0xFF121216))
+                        )
+                        VideoSurface(exoPlayer, Modifier.fillMaxHeight().weight(1f))
+                    } else {
+                        VideoSurface(exoPlayer, Modifier.fillMaxHeight().weight(1f))
+                        ChatPane(
+                            messages = messages,
+                            fontSizeSp = config.fontSizeSp,
+                            modifier = Modifier
+                                .fillMaxHeight()
+                                .fillMaxWidth(config.chatWidthFraction)
+                                .background(Color(0xFF121216))
+                        )
+                    }
+                }
+            }
+
+            ChatDisplayMode.OVERLAY -> {
+                Box(modifier = Modifier.fillMaxSize()) {
+                    VideoSurface(exoPlayer, Modifier.fillMaxSize())
+
+                    val alignment = if (config.chatSide == ChatSide.LEFT) {
+                        Alignment.CenterStart
+                    } else {
+                        Alignment.CenterEnd
+                    }
+
+                    ChatPane(
+                        messages = messages,
+                        fontSizeSp = config.fontSizeSp,
+                        modifier = Modifier
+                            .align(alignment)
+                            .fillMaxHeight(0.85f)
+                            .fillMaxWidth(config.chatWidthFraction)
+                            .padding(12.dp)
+                            .background(
+                                Color.Black.copy(alpha = config.overlayOpacity),
+                                shape = RoundedCornerShape(8.dp)
+                            )
+                    )
+                }
+            }
+        }
+
+        // Top Floating Quick-Controls Bar (Back, Quick Side-Swap, Layout Settings)
+        Row(
+            modifier = Modifier
+                .align(Alignment.TopStart)
+                .padding(12.dp)
+                .background(Color.Black.copy(alpha = 0.6f), RoundedCornerShape(24.dp))
+                .padding(horizontal = 8.dp, vertical = 4.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            IconButton(onClick = onBack) {
+                Icon(Icons.Default.ArrowBack, contentDescription = "Back", tint = Color.White)
+            }
+            // One-tap button to swap Chat Left/Right
+            if (config.displayMode != ChatDisplayMode.HIDDEN) {
+                IconButton(
+                    onClick = {
+                        viewModel.updateLayout {
+                            it.copy(
+                                chatSide = if (it.chatSide == ChatSide.LEFT) ChatSide.RIGHT else ChatSide.LEFT
+                            )
+                        }
+                    }
+                ) {
+                    Icon(Icons.Default.SwapHoriz, contentDescription = "Swap Chat Side", tint = Color.White)
+                }
+            }
+            // Open full layout customization sheet
+            IconButton(onClick = { showSettingsSheet = !showSettingsSheet }) {
+                Icon(Icons.Default.Tune, contentDescription = "Customize Layout", tint = Color.White)
+            }
+        }
+
+        // Customization Overlay Panel
+        AnimatedVisibility(
+            visible = showSettingsSheet,
+            modifier = Modifier.align(Alignment.Center)
+        ) {
+            LayoutCustomizationCard(
+                config = config,
+                hasRenderedChatVideo = !vod.chatVideoPath.isNullOrBlank(),
+                onUpdate = { viewModel.updateLayout(it) },
+                onClose = { showSettingsSheet = false }
+            )
+        }
+    }
+}
+
+@Composable
+fun VideoSurface(exoPlayer: ExoPlayer, modifier: Modifier = Modifier) {
+    AndroidView(
+        factory = { ctx ->
+            PlayerView(ctx).apply {
+                player = exoPlayer
+                useController = true
+            }
+        },
+        modifier = modifier
+    )
+}
+
+@Composable
+fun ChatPane(
+    messages: List<ChatComment>,
+    fontSizeSp: Float,
+    modifier: Modifier = Modifier
+) {
+    val listState = rememberLazyListState()
+
+    // Auto-scroll to bottom when new messages arrive
+    LaunchedEffect(messages.size) {
+        if (messages.isNotEmpty()) {
+            listState.animateScrollToItem(messages.size - 1)
+        }
+    }
+
+    LazyColumn(
+        state = listState,
+        modifier = modifier.padding(horizontal = 8.dp, vertical = 6.dp),
+        verticalArrangement = Arrangement.spacedBy(4.dp)
+    ) {
+        items(messages, key = { it.id }) { comment ->
+            val usernameColor = remember(comment.message.userColor) {
+                try {
+                    Color(AndroidColor.parseColor(comment.message.userColor ?: "#9146FF"))
+                } catch (e: Exception) {
+                    Color(0xFF9146FF)
+                }
+            }
+
+            Text(
+                text = buildAnnotatedString {
+                    withStyle(SpanStyle(color = usernameColor, fontWeight = FontWeight.Bold)) {
+                        append("${comment.commenter.displayName}: ")
+                    }
+                    withStyle(SpanStyle(color = Color.White)) {
+                        append(comment.message.body)
+                    }
+                },
+                fontSize = fontSizeSp.sp,
+                lineHeight = (fontSizeSp + 4).sp
+            )
+        }
+    }
+}
+
+@Composable
+fun LayoutCustomizationCard(
+    config: PlayerLayoutConfig,
+    hasRenderedChatVideo: Boolean,
+    onUpdate: ((PlayerLayoutConfig) -> PlayerLayoutConfig) -> Unit,
+    onClose: () -> Unit
+) {
+    Card(
+        modifier = Modifier.width(340.dp).padding(16.dp),
+        colors = CardDefaults.cardColors(containerColor = Color(0xEE1E1E24))
+    ) {
+        Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+            Text("Player & Chat Layout", style = MaterialTheme.typography.titleMedium, color = Color.White)
+
+            // Display Mode Selector
+            Text("Chat Mode", style = MaterialTheme.typography.labelMedium, color = Color.LightGray)
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                ChatDisplayMode.entries.forEach { mode ->
+                    FilterChip(
+                        selected = config.displayMode == mode,
+                        onClick = { onUpdate { it.copy(displayMode = mode) } },
+                        label = { Text(mode.name.replace("_", " ")) }
+                    )
+                }
+            }
+
+            if (config.displayMode != ChatDisplayMode.HIDDEN) {
+                // Left / Right Selector
+                Text("Chat Position", style = MaterialTheme.typography.labelMedium, color = Color.LightGray)
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    ChatSide.entries.forEach { side ->
+                        FilterChip(
+                            selected = config.chatSide == side,
+                            onClick = { onUpdate { it.copy(chatSide = side) } },
+                            label = { Text(side.name) }
+                        )
+                    }
+                }
+
+                // Chat Width Slider
+                Text(
+                    "Chat Width: ${(config.chatWidthFraction * 100).toInt()}%",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = Color.LightGray
+                )
+                Slider(
+                    value = config.chatWidthFraction,
+                    onValueChange = { w -> onUpdate { it.copy(chatWidthFraction = w) } },
+                    valueRange = 0.18f..0.45f
+                )
+
+                // Overlay Opacity Slider (only in OVERLAY mode)
+                if (config.displayMode == ChatDisplayMode.OVERLAY) {
+                    Text(
+                        "Overlay Background Opacity: ${(config.overlayOpacity * 100).toInt()}%",
+                        style = MaterialTheme.typography.labelMedium,
+                        color = Color.LightGray
+                    )
+                    Slider(
+                        value = config.overlayOpacity,
+                        onValueChange = { a -> onUpdate { it.copy(overlayOpacity = a) } },
+                        valueRange = 0.1f..0.9f
+                    )
+                }
+            }
+
+            // Optional switch for Ganymede's pre-rendered chat MP4
+            if (hasRenderedChatVideo) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text("Stream Rendered Chat MP4", color = Color.White, fontSize = 14.sp)
+                    Switch(
+                        checked = config.useRenderedChatVideo,
+                        onCheckedChange = { useRendered ->
+                            onUpdate {
+                                it.copy(
+                                    useRenderedChatVideo = useRendered,
+                                    // Auto-hide JSON chat if watching the burned-in chat video
+                                    displayMode = if (useRendered) ChatDisplayMode.HIDDEN else it.displayMode
+                                )
+                            }
+                        }
+                    )
+                }
+            }
+
+            Button(onClick = onClose, modifier = Modifier.align(Alignment.End)) {
+                Text("Done")
+            }
+        }
+    }
+}
+5. VOD Browser & Entry Point (MainActivity.kt)Finally, wire up a minimal VOD browser screen where you enter your Ganymede server URL, browse your archived streams, and launch the customizable player.Kotlinpackage com.example.ganymedeclient
+
+import android.os.Bundle
+import androidx.activity.ComponentActivity
+import androidx.activity.compose.setContent
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.grid.GridCells
+import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
+import androidx.compose.foundation.lazy.grid.items
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.dp
+import androidx.lifecycle.viewmodel.compose.viewModel
+import coil.compose.AsyncImage
+import com.example.ganymedeclient.network.GanymedeVod
+import com.example.ganymedeclient.ui.GanymedePlayerScreen
+import com.example.ganymedeclient.ui.PlayerViewModel
+
+class MainActivity : ComponentActivity() {
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        setContent {
+            MaterialTheme(colorScheme = darkColorScheme()) {
+                Surface(modifier = Modifier.fillMaxSize()) {
+                    GanymedeApp()
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun GanymedeApp(viewModel: PlayerViewModel = viewModel()) {
+    var selectedVod by remember { mutableStateOf<GanymedeVod?>(null) }
+    var serverUrlInput by remember { mutableStateOf("http://192.168.1.100:4000") }
+    var apiKeyInput by remember { mutableStateOf("") }
+    val vods by viewModel.vods.collectAsState()
+
+    if (selectedVod != null) {
+        GanymedePlayerScreen(
+            vod = selectedVod!!,
+            viewModel = viewModel,
+            onBack = { selectedVod = null }
+        )
+    } else {
+        Column(modifier = Modifier.fillMaxSize().padding(16.dp)) {
+            // Connection Bar
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                OutlinedTextField(
+                    value = serverUrlInput,
+                    onValueChange = { serverUrlInput = it },
+                    label = { Text("Ganymede URL") },
+                    singleLine = true,
+                    modifier = Modifier.weight(1f)
+                )
+                OutlinedTextField(
+                    value = apiKeyInput,
+                    onValueChange = { apiKeyInput = it },
+                    label = { Text("API Key (Optional)") },
+                    singleLine = true,
+                    modifier = Modifier.weight(0.7f)
+                )
+                Button(
+                    onClick = { viewModel.connectToServer(serverUrlInput, apiKeyInput) },
+                    modifier = Modifier.padding(top = 8.dp)
+                ) {
+                    Text("Connect")
+                }
+            }
+
+            Spacer(modifier = Modifier.height(16.dp))
+
+            // VOD Grid
+            LazyVerticalGrid(
+                columns = GridCells.Adaptive(minSize = 240.dp),
+                horizontalArrangement = Arrangement.spacedBy(12.dp),
+                verticalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
+                items(vods, key = { it.id }) { vod ->
+                    Card(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clickable { selectedVod = vod }
+                    ) {
+                        Column {
+                            AsyncImage(
+                                model = vod.getFullThumbnailUrl(viewModel.serverUrl),
+                                contentDescription = vod.title,
+                                contentScale = ContentScale.Crop,
+                                modifier = Modifier.fillMaxWidth().height(135.dp)
+                            )
+                            Column(modifier = Modifier.padding(10.dp)) {
+                                Text(
+                                    text = vod.title,
+                                    style = MaterialTheme.typography.bodyMedium,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                                Text(
+                                    text = vod.edges?.channel?.displayName ?: "",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.primary
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+Next Steps / Enhancements You Can Add7TV / BTTV / FFZ Emote Rendering: Ganymede exposes /api/v1/vod/{id}/chat/emotes which returns the emote URLs for that specific stream. You can use Compose's InlineTextContent with Coil to render animated emotes inside ChatPane.Server-Side Playback Progress Sync: If you pass an API key with playback scope, you can POST the current second to /api/v1/playback/progress every 15 seconds so your watch progress syncs between your desktop browser and Android app.
