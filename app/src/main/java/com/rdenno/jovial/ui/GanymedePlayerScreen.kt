@@ -1,19 +1,22 @@
 package com.rdenno.jovial.ui
 
 import android.app.Activity
+import android.app.PendingIntent
 import android.app.PictureInPictureParams
+import android.content.Context
+import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Color as AndroidColor
+import android.net.Uri
 import android.os.Build
 import android.util.Base64
 import android.util.Rational
 import android.view.WindowManager
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
+import androidx.annotation.OptIn
 import androidx.annotation.RequiresApi
 import androidx.compose.animation.AnimatedVisibility
-import androidx.compose.animation.fadeIn
-import androidx.compose.animation.fadeOut
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
@@ -25,11 +28,12 @@ import androidx.compose.foundation.text.InlineTextContent
 import androidx.compose.foundation.text.appendInlineContent
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.automirrored.filled.ArrowBack
-import androidx.compose.material.icons.automirrored.filled.Chat
-import androidx.compose.material.icons.filled.SpeakerNotesOff
-import androidx.compose.material.icons.filled.SwapHoriz
-import androidx.compose.material.icons.filled.Tune
+import androidx.compose.material.icons.automirrored.rounded.ArrowBack
+import androidx.compose.material.icons.automirrored.rounded.Chat
+import androidx.compose.material.icons.rounded.SpeakerNotesOff
+import androidx.compose.material.icons.rounded.SwapHoriz
+import androidx.compose.material.icons.rounded.SwapVert
+import androidx.compose.material.icons.rounded.Tune
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -42,30 +46,36 @@ import androidx.compose.ui.text.PlaceholderVerticalAlign
 import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.app.PictureInPictureModeChangedInfo
 import androidx.core.util.Consumer
 import androidx.core.view.WindowInsetsControllerCompat
 import androidx.lifecycle.Lifecycle
-import androidx.lifecycle.LifecycleEventObserver
+import androidx.media3.common.AudioAttributes
+import androidx.media3.common.C
 import androidx.media3.common.MediaItem
+import androidx.media3.common.MediaMetadata
 import androidx.media3.common.Player
 import androidx.media3.common.VideoSize
+import androidx.media3.common.util.UnstableApi
+import androidx.media3.datasource.DataSourceBitmapLoader
 import androidx.media3.datasource.okhttp.OkHttpDataSource
 import androidx.media3.exoplayer.DefaultLoadControl
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
+import androidx.media3.session.CacheBitmapLoader
 import androidx.media3.session.MediaSession
-import androidx.media3.ui.PlayerView
 import coil.ImageLoader
 import coil.compose.AsyncImage
 import coil.decode.GifDecoder
 import coil.decode.ImageDecoderDecoder
+import com.rdenno.jovial.MainActivity
+import com.rdenno.jovial.PlaybackService
 import com.rdenno.jovial.network.ChatComment
 import com.rdenno.jovial.network.GanymedeApi
 import com.rdenno.jovial.network.GanymedeEmote
@@ -122,6 +132,17 @@ fun GanymedePlayerScreen(
         ExoPlayer.Builder(context)
             .setMediaSourceFactory(DefaultMediaSourceFactory(context).setDataSourceFactory(dataSourceFactory))
             .setLoadControl(loadControl)
+            // Pause for calls / other media, and when headphones are unplugged
+            .setAudioAttributes(
+                AudioAttributes.Builder()
+                    .setUsage(C.USAGE_MEDIA)
+                    .setContentType(C.AUDIO_CONTENT_TYPE_MOVIE)
+                    .build(),
+                /* handleAudioFocus = */ true
+            )
+            .setHandleAudioBecomingNoisy(true)
+            // Keep the CPU and Wi-Fi awake so playback continues with the screen off
+            .setWakeMode(C.WAKE_MODE_NETWORK)
             .build()
     }
 
@@ -141,11 +162,16 @@ fun GanymedePlayerScreen(
         }
     }
 
-    // Media session gives the picture-in-picture window its play/pause controls.
+    // The media session drives the notification / lock screen controls and the PiP window's
+    // play/pause button; PlaybackService keeps it alive in the background.
     // Declared after the effect above so it is disposed (released) before the player is.
     DisposableEffect(exoPlayer) {
-        val session = MediaSession.Builder(context, exoPlayer).build()
-        onDispose { session.release() }
+        val session = buildMediaSession(context, exoPlayer)
+        PlaybackService.attach(context, session)
+        onDispose {
+            PlaybackService.detach(context, session)
+            session.release()
+        }
     }
 
     val activity = context as? ComponentActivity
@@ -155,7 +181,11 @@ fun GanymedePlayerScreen(
     }
     var isPlaying by remember { mutableStateOf(false) }
     var isInPip by remember { mutableStateOf(activity?.isInPictureInPictureMode == true) }
-    var videoAspect by remember { mutableStateOf(Rational(16, 9)) }
+    var videoAspect by remember { mutableFloatStateOf(16f / 9f) }
+    // Android rejects PiP aspect ratios outside 1:2.39 .. 2.39:1
+    val pipAspect = remember(videoAspect) {
+        Rational((videoAspect.coerceIn(1f / 2.39f, 2.39f) * 10_000).toInt(), 10_000)
+    }
 
     DisposableEffect(exoPlayer) {
         val listener = object : Player.Listener {
@@ -165,10 +195,7 @@ fun GanymedePlayerScreen(
 
             override fun onVideoSizeChanged(videoSize: VideoSize) {
                 if (videoSize.width > 0 && videoSize.height > 0) {
-                    // Android rejects PiP aspect ratios outside 1:2.39 .. 2.39:1
-                    val ratio = (videoSize.width * videoSize.pixelWidthHeightRatio / videoSize.height)
-                        .coerceIn(1f / 2.39f, 2.39f)
-                    videoAspect = Rational((ratio * 10_000).toInt(), 10_000)
+                    videoAspect = videoSize.width * videoSize.pixelWidthHeightRatio / videoSize.height
                 }
             }
         }
@@ -187,9 +214,9 @@ fun GanymedePlayerScreen(
     }
 
     // Android 12+: the system enters PiP on its own when leaving the app while this is enabled
-    LaunchedEffect(isPlaying, videoAspect, pipSupported) {
+    LaunchedEffect(isPlaying, pipAspect, pipSupported) {
         if (pipSupported && Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            activity?.setPictureInPictureParams(buildPipParams(videoAspect, autoEnter = isPlaying))
+            activity?.setPictureInPictureParams(buildPipParams(pipAspect, autoEnter = isPlaying))
         }
     }
 
@@ -201,29 +228,28 @@ fun GanymedePlayerScreen(
             if (pipSupported && Build.VERSION.SDK_INT >= Build.VERSION_CODES.O &&
                 Build.VERSION.SDK_INT < Build.VERSION_CODES.S && exoPlayer.isPlaying
             ) {
-                activity.enterPictureInPictureMode(buildPipParams(videoAspect, autoEnter = false))
+                activity.enterPictureInPictureMode(buildPipParams(pipAspect, autoEnter = false))
             }
         }
+        // Playback continues in the background (screen off, other apps) with a media notification,
+        // but dismissing the PiP window means the user is done watching: pause then.
         val pipModeListener = Consumer<PictureInPictureModeChangedInfo> { info ->
             isInPip = info.isInPictureInPictureMode
-        }
-        // Closing the PiP window (or leaving without PiP) stops the activity: pause playback
-        val lifecycleObserver = LifecycleEventObserver { _, event ->
-            if (event == Lifecycle.Event.ON_STOP) {
+            if (!info.isInPictureInPictureMode &&
+                !activity.lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)
+            ) {
                 exoPlayer.pause()
             }
         }
         activity.addOnUserLeaveHintListener(userLeaveListener)
         activity.addOnPictureInPictureModeChangedListener(pipModeListener)
-        activity.lifecycle.addObserver(lifecycleObserver)
 
         onDispose {
             activity.removeOnUserLeaveHintListener(userLeaveListener)
             activity.removeOnPictureInPictureModeChangedListener(pipModeListener)
-            activity.lifecycle.removeObserver(lifecycleObserver)
             // Leaving the player must not auto-enter PiP from the VOD list
             if (pipSupported && Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                activity.setPictureInPictureParams(buildPipParams(videoAspect, autoEnter = false))
+                activity.setPictureInPictureParams(buildPipParams(pipAspect, autoEnter = false))
             }
         }
     }
@@ -252,7 +278,20 @@ fun GanymedePlayerScreen(
         }
 
         val videoUrl = vod.getFullVideoUrl(viewModel.serverUrl, config.useRenderedChatVideo)
-        exoPlayer.setMediaItem(MediaItem.fromUri(videoUrl), startPos)
+        val metadata = MediaMetadata.Builder()
+            .setTitle(vod.title)
+            .setArtist(vod.edges?.channel?.displayName?.ifBlank { null } ?: vod.edges?.channel?.name)
+            .apply {
+                val thumbnail = vod.getFullThumbnailUrl(viewModel.serverUrl)
+                if (!thumbnail.endsWith("/")) setArtworkUri(Uri.parse(thumbnail))
+            }
+            .build()
+        val mediaItem = MediaItem.Builder()
+            .setUri(videoUrl)
+            .setMediaId(vod.id)
+            .setMediaMetadata(metadata)
+            .build()
+        exoPlayer.setMediaItem(mediaItem, startPos)
         exoPlayer.prepare()
         exoPlayer.playWhenReady = true
 
@@ -283,161 +322,151 @@ fun GanymedePlayerScreen(
     if (isInPip) {
         VideoSurface(
             exoPlayer = exoPlayer,
-            onControlsVisibilityChanged = { },
-            showControls = false,
             modifier = Modifier.fillMaxSize().background(Color.Black)
         )
         return
     }
 
-    Box(modifier = Modifier.fillMaxSize().background(Color.Black)) {
-        when (config.displayMode) {
-            ChatDisplayMode.HIDDEN -> {
-                VideoSurface(
-                    exoPlayer = exoPlayer,
-                    onControlsVisibilityChanged = { controlsVisible = it },
-                    modifier = Modifier.fillMaxSize()
-                )
-            }
+    BoxWithConstraints(modifier = Modifier.fillMaxSize().background(Color.Black)) {
+        // In portrait, chat always goes above / below the video instead of beside it
+        val isPortrait = maxHeight > maxWidth
+        val chatFirst = config.chatSide == ChatSide.LEFT
 
-            ChatDisplayMode.SIDE_BY_SIDE -> {
-                Row(modifier = Modifier.fillMaxSize()) {
-                    if (config.chatSide == ChatSide.LEFT) {
-                        ChatPane(
-                            messages = messages,
-                            emoteCatalog = emoteCatalog,
-                            emoteImageLoader = emoteImageLoader,
-                            fontSizeSp = config.fontSizeSp,
-                            modifier = Modifier
-                                .fillMaxHeight()
-                                .fillMaxWidth(config.chatWidthFraction)
-                                .background(Color(0xFF121216))
-                        )
-                        VideoSurface(
-                            exoPlayer = exoPlayer,
-                            onControlsVisibilityChanged = { controlsVisible = it },
-                            modifier = Modifier.fillMaxHeight().weight(1f)
-                        )
+        @Composable
+        fun RowScope.TopBar() {
+            IconButton(onClick = { handleBack() }) {
+                Icon(Icons.AutoMirrored.Rounded.ArrowBack, contentDescription = "Back", tint = Color.White)
+            }
+            Text(
+                text = vod.title,
+                color = Color.White,
+                fontSize = 15.sp,
+                fontWeight = FontWeight.Medium,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.weight(1f)
+            )
+
+            // Quick Show / Hide Chat button
+            IconButton(
+                onClick = {
+                    if (config.displayMode == ChatDisplayMode.HIDDEN) {
+                        viewModel.updateLayout { it.copy(displayMode = lastVisibleMode) }
                     } else {
-                        VideoSurface(
-                            exoPlayer = exoPlayer,
-                            onControlsVisibilityChanged = { controlsVisible = it },
-                            modifier = Modifier.fillMaxHeight().weight(1f)
-                        )
-                        ChatPane(
-                            messages = messages,
-                            emoteCatalog = emoteCatalog,
-                            emoteImageLoader = emoteImageLoader,
-                            fontSizeSp = config.fontSizeSp,
-                            modifier = Modifier
-                                .fillMaxHeight()
-                                .fillMaxWidth(config.chatWidthFraction)
-                                .background(Color(0xFF121216))
-                        )
+                        lastVisibleMode = config.displayMode
+                        viewModel.updateLayout { it.copy(displayMode = ChatDisplayMode.HIDDEN) }
                     }
                 }
-            }
-
-            ChatDisplayMode.OVERLAY -> {
-                Box(modifier = Modifier.fillMaxSize()) {
-                    VideoSurface(
-                        exoPlayer = exoPlayer,
-                        onControlsVisibilityChanged = { controlsVisible = it },
-                        modifier = Modifier.fillMaxSize()
-                    )
-
-                    val alignment = if (config.chatSide == ChatSide.LEFT) {
-                        Alignment.CenterStart
-                    } else {
-                        Alignment.CenterEnd
-                    }
-
-                    ChatPane(
-                        messages = messages,
-                        emoteCatalog = emoteCatalog,
-                        emoteImageLoader = emoteImageLoader,
-                        fontSizeSp = config.fontSizeSp,
-                        modifier = Modifier
-                            .align(alignment)
-                            .fillMaxHeight(0.85f)
-                            .fillMaxWidth(config.chatWidthFraction)
-                            .padding(12.dp)
-                            .background(
-                                Color.Black.copy(alpha = config.overlayOpacity),
-                                shape = RoundedCornerShape(8.dp)
-                            )
-                    )
-                }
-            }
-        }
-
-        // Top Floating Quick-Controls Bar (Shown only when player controls are visible)
-        AnimatedVisibility(
-            visible = controlsVisible,
-            enter = fadeIn(),
-            exit = fadeOut(),
-            modifier = Modifier.align(Alignment.TopStart)
-        ) {
-            Row(
-                modifier = Modifier
-                    .padding(16.dp)
-                    .background(Color.Black.copy(alpha = 0.65f), RoundedCornerShape(24.dp))
-                    .padding(horizontal = 8.dp, vertical = 4.dp),
-                verticalAlignment = Alignment.CenterVertically
             ) {
-                // Back button
-                IconButton(onClick = { handleBack() }) {
-                    Icon(
-                        Icons.AutoMirrored.Filled.ArrowBack,
-                        contentDescription = "Back",
-                        tint = Color.White
-                    )
+                if (config.displayMode == ChatDisplayMode.HIDDEN) {
+                    Icon(Icons.AutoMirrored.Rounded.Chat, contentDescription = "Show Chat", tint = Color.White)
+                } else {
+                    Icon(Icons.Rounded.SpeakerNotesOff, contentDescription = "Hide Chat", tint = Color.White)
                 }
+            }
 
-                // Quick Show / Hide Chat button
+            // One-tap button to swap chat side (left / right, or top / bottom in portrait)
+            if (config.displayMode != ChatDisplayMode.HIDDEN) {
                 IconButton(
                     onClick = {
-                        if (config.displayMode == ChatDisplayMode.HIDDEN) {
-                            viewModel.updateLayout { it.copy(displayMode = lastVisibleMode) }
-                        } else {
-                            lastVisibleMode = config.displayMode
-                            viewModel.updateLayout { it.copy(displayMode = ChatDisplayMode.HIDDEN) }
+                        viewModel.updateLayout {
+                            it.copy(chatSide = if (it.chatSide == ChatSide.LEFT) ChatSide.RIGHT else ChatSide.LEFT)
                         }
                     }
                 ) {
-                    if (config.displayMode == ChatDisplayMode.HIDDEN) {
-                        Icon(
-                            imageVector = Icons.AutoMirrored.Filled.Chat,
-                            contentDescription = "Show Chat",
-                            tint = Color.White
-                        )
-                    } else {
-                        Icon(
-                            imageVector = Icons.Default.SpeakerNotesOff,
-                            contentDescription = "Hide Chat",
-                            tint = Color.White
-                        )
+                    Icon(
+                        if (isPortrait) Icons.Rounded.SwapVert else Icons.Rounded.SwapHoriz,
+                        contentDescription = "Swap Chat Side",
+                        tint = Color.White
+                    )
+                }
+            }
+
+            // Open full layout customization sheet
+            IconButton(onClick = { showSettingsSheet = !showSettingsSheet }) {
+                Icon(Icons.Rounded.Tune, contentDescription = "Customize Layout", tint = Color.White)
+            }
+        }
+
+        @Composable
+        fun Chat(modifier: Modifier) {
+            ChatPane(
+                messages = messages,
+                emoteCatalog = emoteCatalog,
+                emoteImageLoader = emoteImageLoader,
+                fontSizeSp = config.fontSizeSp,
+                modifier = modifier
+            )
+        }
+
+        // Video with controls on top; `overlayContent` draws between the two (overlay chat)
+        @Composable
+        fun VideoPlayer(modifier: Modifier, overlayContent: @Composable BoxScope.() -> Unit = {}) {
+            Box(modifier = modifier) {
+                VideoSurface(exoPlayer = exoPlayer, modifier = Modifier.fillMaxSize())
+                overlayContent()
+                PlayerControlsOverlay(
+                    player = exoPlayer,
+                    visible = controlsVisible,
+                    onVisibleChange = { controlsVisible = it },
+                    modifier = Modifier.fillMaxSize(),
+                    topBar = { TopBar() }
+                )
+            }
+        }
+
+        val chatBackground = Modifier.background(Color(0xFF121216))
+
+        when (config.displayMode) {
+            ChatDisplayMode.HIDDEN -> VideoPlayer(Modifier.fillMaxSize())
+
+            ChatDisplayMode.SIDE_BY_SIDE -> if (isPortrait) {
+                Column(
+                    modifier = Modifier.fillMaxSize(),
+                    horizontalAlignment = Alignment.CenterHorizontally
+                ) {
+                    if (chatFirst) Chat(Modifier.fillMaxWidth().weight(1f).then(chatBackground))
+                    VideoPlayer(
+                        Modifier
+                            .fillMaxWidth()
+                            .heightIn(max = maxHeight * 0.6f)
+                            .aspectRatio(videoAspect.coerceIn(0.5f, 3f))
+                    )
+                    if (!chatFirst) Chat(Modifier.fillMaxWidth().weight(1f).then(chatBackground))
+                }
+            } else {
+                Row(modifier = Modifier.fillMaxSize()) {
+                    if (chatFirst) {
+                        Chat(Modifier.fillMaxHeight().fillMaxWidth(config.chatWidthFraction).then(chatBackground))
+                    }
+                    VideoPlayer(Modifier.fillMaxHeight().weight(1f))
+                    if (!chatFirst) {
+                        Chat(Modifier.fillMaxHeight().fillMaxWidth(config.chatWidthFraction).then(chatBackground))
                     }
                 }
+            }
 
-                // One-tap button to swap Chat Left / Right (only when chat is visible)
-                if (config.displayMode != ChatDisplayMode.HIDDEN) {
-                    IconButton(
-                        onClick = {
-                            viewModel.updateLayout {
-                                it.copy(
-                                    chatSide = if (it.chatSide == ChatSide.LEFT) ChatSide.RIGHT else ChatSide.LEFT
-                                )
-                            }
-                        }
-                    ) {
-                        Icon(Icons.Default.SwapHoriz, contentDescription = "Swap Chat Side", tint = Color.White)
-                    }
-                }
-
-                // Open full layout customization sheet
-                IconButton(onClick = { showSettingsSheet = !showSettingsSheet }) {
-                    Icon(Icons.Default.Tune, contentDescription = "Customize Layout", tint = Color.White)
+            ChatDisplayMode.OVERLAY -> VideoPlayer(Modifier.fillMaxSize()) {
+                val overlayShape = RoundedCornerShape(8.dp)
+                val overlayBackground = Modifier.background(Color.Black.copy(alpha = config.overlayOpacity), overlayShape)
+                if (isPortrait) {
+                    Chat(
+                        Modifier
+                            .align(if (chatFirst) Alignment.TopCenter else Alignment.BottomCenter)
+                            .fillMaxWidth()
+                            .fillMaxHeight(0.4f)
+                            .padding(12.dp)
+                            .then(overlayBackground)
+                    )
+                } else {
+                    Chat(
+                        Modifier
+                            .align(if (chatFirst) Alignment.CenterStart else Alignment.CenterEnd)
+                            .fillMaxHeight(0.85f)
+                            .fillMaxWidth(config.chatWidthFraction)
+                            .padding(12.dp)
+                            .then(overlayBackground)
+                    )
                 }
             }
         }
@@ -449,6 +478,7 @@ fun GanymedePlayerScreen(
         ) {
             LayoutCustomizationCard(
                 config = config,
+                isPortrait = isPortrait,
                 hasRenderedChatVideo = !vod.chatVideoPath.isNullOrBlank(),
                 loadedEmoteCount = emoteCatalog.byName.size + emoteCatalog.byId.size,
                 onUpdate = { viewModel.updateLayout(it) },
@@ -458,6 +488,28 @@ fun GanymedePlayerScreen(
     }
 }
 
+@OptIn(UnstableApi::class)
+private fun buildMediaSession(context: Context, player: Player): MediaSession {
+    // Tapping the notification brings the app (and the playing video) back
+    val openApp = PendingIntent.getActivity(
+        context,
+        0,
+        Intent(context, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP),
+        PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+    )
+    // Load notification artwork through the API client so the server's API key is sent
+    val bitmapLoader = CacheBitmapLoader(
+        DataSourceBitmapLoader(
+            DataSourceBitmapLoader.DEFAULT_EXECUTOR_SERVICE.get(),
+            OkHttpDataSource.Factory(GanymedeApi.activeClient)
+        )
+    )
+    return MediaSession.Builder(context, player)
+        .setSessionActivity(openApp)
+        .setBitmapLoader(bitmapLoader)
+        .build()
+}
+
 @RequiresApi(Build.VERSION_CODES.O)
 private fun buildPipParams(aspectRatio: Rational, autoEnter: Boolean): PictureInPictureParams {
     val builder = PictureInPictureParams.Builder().setAspectRatio(aspectRatio)
@@ -465,30 +517,6 @@ private fun buildPipParams(aspectRatio: Rational, autoEnter: Boolean): PictureIn
         builder.setAutoEnterEnabled(autoEnter)
     }
     return builder.build()
-}
-
-@Composable
-fun VideoSurface(
-    exoPlayer: ExoPlayer,
-    onControlsVisibilityChanged: (Boolean) -> Unit,
-    modifier: Modifier = Modifier,
-    showControls: Boolean = true
-) {
-    AndroidView(
-        factory = { ctx ->
-            PlayerView(ctx).apply {
-                player = exoPlayer
-                setShowBuffering(PlayerView.SHOW_BUFFERING_ALWAYS)
-                setControllerVisibilityListener(PlayerView.ControllerVisibilityListener { visibility ->
-                    onControlsVisibilityChanged(visibility == android.view.View.VISIBLE)
-                })
-            }
-        },
-        update = { view -> view.useController = showControls },
-        // Entering/leaving PiP swaps in a new PlayerView; detach the old one from the player
-        onRelease = { view -> view.player = null },
-        modifier = modifier
-    )
 }
 
 private sealed interface ParsedChatSegment {
@@ -693,6 +721,7 @@ private fun ChatCommentRow(
 @Composable
 fun LayoutCustomizationCard(
     config: PlayerLayoutConfig,
+    isPortrait: Boolean,
     hasRenderedChatVideo: Boolean,
     loadedEmoteCount: Int,
     onUpdate: ((PlayerLayoutConfig) -> PlayerLayoutConfig) -> Unit,
@@ -732,35 +761,50 @@ fun LayoutCustomizationCard(
                     FilterChip(
                         selected = config.displayMode == mode,
                         onClick = { onUpdate { it.copy(displayMode = mode) } },
-                        label = { Text(mode.name.replace("_", " ")) }
+                        label = {
+                            Text(
+                                if (isPortrait && mode == ChatDisplayMode.SIDE_BY_SIDE) "STACKED"
+                                else mode.name.replace("_", " ")
+                            )
+                        }
                     )
                 }
             }
 
             if (config.displayMode != ChatDisplayMode.HIDDEN) {
-                // Left / Right Selector
+                // Left / Right Selector (Top / Bottom in portrait)
                 Text("Chat Position", style = MaterialTheme.typography.labelMedium, color = Color.LightGray)
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     ChatSide.entries.forEach { side ->
                         FilterChip(
                             selected = config.chatSide == side,
                             onClick = { onUpdate { it.copy(chatSide = side) } },
-                            label = { Text(side.name) }
+                            label = {
+                                Text(
+                                    when {
+                                        !isPortrait -> side.name
+                                        side == ChatSide.LEFT -> "TOP"
+                                        else -> "BOTTOM"
+                                    }
+                                )
+                            }
                         )
                     }
                 }
 
-                // Chat Width Slider
-                Text(
-                    "Chat Width: ${(config.chatWidthFraction * 100).toInt()}%",
-                    style = MaterialTheme.typography.labelMedium,
-                    color = Color.LightGray
-                )
-                Slider(
-                    value = config.chatWidthFraction,
-                    onValueChange = { w -> onUpdate { it.copy(chatWidthFraction = w) } },
-                    valueRange = 0.18f..0.45f
-                )
+                // Chat Width Slider (portrait chat always spans the full width)
+                if (!isPortrait) {
+                    Text(
+                        "Chat Width: ${(config.chatWidthFraction * 100).toInt()}%",
+                        style = MaterialTheme.typography.labelMedium,
+                        color = Color.LightGray
+                    )
+                    Slider(
+                        value = config.chatWidthFraction,
+                        onValueChange = { w -> onUpdate { it.copy(chatWidthFraction = w) } },
+                        valueRange = 0.18f..0.45f
+                    )
+                }
 
                 // Chat Font & Emote Size Slider
                 Text(

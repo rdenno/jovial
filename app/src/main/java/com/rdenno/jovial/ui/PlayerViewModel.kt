@@ -13,6 +13,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.flow.updateAndGet
 import kotlinx.coroutines.launch
 import java.io.File
 import kotlin.math.abs
@@ -22,6 +23,12 @@ private const val CHAT_FETCH_WINDOW_SECONDS = 30.0
 // Fetch the next window once fewer than this many seconds of chat remain buffered
 private const val CHAT_PREFETCH_MARGIN_SECONDS = 15.0
 private const val MAX_VISIBLE_CHAT = 150
+
+private const val KEY_DISPLAY_MODE = "layout_display_mode"
+private const val KEY_CHAT_SIDE = "layout_chat_side"
+private const val KEY_CHAT_WIDTH = "layout_chat_width"
+private const val KEY_OVERLAY_OPACITY = "layout_overlay_opacity"
+private const val KEY_FONT_SIZE = "layout_font_size"
 
 enum class ChatDisplayMode {
     HIDDEN,
@@ -92,9 +99,43 @@ class PlayerViewModel : ViewModel() {
     private var chatGeneration = 0
 
     fun initPreferences(prefs: android.content.SharedPreferences, cacheDir: File) {
+        // The ViewModel outlives activity recreation; only load the saved layout the first time
+        val firstInit = sharedPrefs == null
         sharedPrefs = prefs
         GanymedeApi.cacheDir = cacheDir
         loadAllSavedProgress()
+        if (firstInit) loadLayoutConfig()
+    }
+
+    private fun loadLayoutConfig() {
+        val prefs = sharedPrefs ?: return
+        val defaults = PlayerLayoutConfig()
+        _layoutConfig.value = defaults.copy(
+            displayMode = prefs.getString(KEY_DISPLAY_MODE, null)
+                ?.let { name -> ChatDisplayMode.entries.firstOrNull { it.name == name } }
+                ?: defaults.displayMode,
+            chatSide = prefs.getString(KEY_CHAT_SIDE, null)
+                ?.let { name -> ChatSide.entries.firstOrNull { it.name == name } }
+                ?: defaults.chatSide,
+            chatWidthFraction = prefs.getFloat(KEY_CHAT_WIDTH, defaults.chatWidthFraction),
+            overlayOpacity = prefs.getFloat(KEY_OVERLAY_OPACITY, defaults.overlayOpacity),
+            fontSizeSp = prefs.getFloat(KEY_FONT_SIZE, defaults.fontSizeSp)
+        )
+    }
+
+    // The rendered-chat video toggle is per VOD, so it is deliberately not persisted, and neither
+    // is the HIDDEN chat mode it forces
+    private fun saveLayoutConfig(config: PlayerLayoutConfig) {
+        val editor = sharedPrefs?.edit() ?: return
+        if (!config.useRenderedChatVideo) {
+            editor.putString(KEY_DISPLAY_MODE, config.displayMode.name)
+        }
+        editor
+            .putString(KEY_CHAT_SIDE, config.chatSide.name)
+            .putFloat(KEY_CHAT_WIDTH, config.chatWidthFraction)
+            .putFloat(KEY_OVERLAY_OPACITY, config.overlayOpacity)
+            .putFloat(KEY_FONT_SIZE, config.fontSizeSp)
+            .apply()
     }
 
     private fun loadAllSavedProgress() {
@@ -197,7 +238,8 @@ class PlayerViewModel : ViewModel() {
     }
 
     fun updateLayout(transform: (PlayerLayoutConfig) -> PlayerLayoutConfig) {
-        _layoutConfig.update(transform)
+        val updated = _layoutConfig.updateAndGet(transform)
+        saveLayoutConfig(updated)
     }
 
     /**
