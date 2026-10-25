@@ -6,6 +6,7 @@ import android.app.PictureInPictureParams
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.content.res.Configuration
 import android.graphics.Color as AndroidColor
 import android.net.Uri
 import android.os.Build
@@ -17,6 +18,8 @@ import androidx.activity.compose.BackHandler
 import androidx.annotation.OptIn
 import androidx.annotation.RequiresApi
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.core.animate
+import androidx.compose.foundation.gestures.detectVerticalDragGestures
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
@@ -40,7 +43,12 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.zIndex
 import androidx.compose.ui.text.Placeholder
 import androidx.compose.ui.text.PlaceholderVerticalAlign
 import androidx.compose.ui.text.SpanStyle
@@ -81,6 +89,7 @@ import com.rdenno.jovial.network.GanymedeApi
 import com.rdenno.jovial.network.GanymedeEmote
 import com.rdenno.jovial.network.GanymedeVod
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 
 @Composable
 fun GanymedePlayerScreen(
@@ -146,16 +155,9 @@ fun GanymedePlayerScreen(
             .build()
     }
 
-    // Hide Status & Navigation bars (Immersive Fullscreen Mode) while watching video
+    // Release the player when leaving the screen
     DisposableEffect(Unit) {
-        val insetsController = window?.let { WindowCompat.getInsetsController(it, it.decorView) }
-        insetsController?.apply {
-            systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
-            hide(WindowInsetsCompat.Type.systemBars())
-        }
-
         onDispose {
-            insetsController?.show(WindowInsetsCompat.Type.systemBars())
             viewModel.savePlaybackPosition(vod.id, exoPlayer.currentPosition)
             viewModel.resetChatState()
             exoPlayer.release()
@@ -175,6 +177,22 @@ fun GanymedePlayerScreen(
     }
 
     val activity = context as? ComponentActivity
+    val isLandscape = LocalConfiguration.current.orientation == Configuration.ORIENTATION_LANDSCAPE
+    val fullscreenController = rememberFullscreenController(activity)
+
+    // Like YouTube: landscape is immersive fullscreen, portrait keeps the status & navigation bars
+    DisposableEffect(window, isLandscape) {
+        val insetsController = window?.let { WindowCompat.getInsetsController(it, it.decorView) }
+        insetsController?.apply {
+            systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+            if (isLandscape) {
+                hide(WindowInsetsCompat.Type.systemBars())
+            } else {
+                show(WindowInsetsCompat.Type.systemBars())
+            }
+        }
+        onDispose { insetsController?.show(WindowInsetsCompat.Type.systemBars()) }
+    }
     val pipSupported = remember(activity) {
         Build.VERSION.SDK_INT >= Build.VERSION_CODES.O &&
             activity?.packageManager?.hasSystemFeature(PackageManager.FEATURE_PICTURE_IN_PICTURE) == true
@@ -259,8 +277,13 @@ fun GanymedePlayerScreen(
         onBack()
     }
 
+    // Back leaves fullscreen first, then the player
     BackHandler {
-        handleBack()
+        if (isLandscape && fullscreenController != null) {
+            fullscreenController.exitFullscreen()
+        } else {
+            handleBack()
+        }
     }
 
     // Load 7TV / BTTV / FFZ / Twitch emotes for this VOD in background
@@ -327,11 +350,27 @@ fun GanymedePlayerScreen(
         return
     }
 
-    BoxWithConstraints(modifier = Modifier.fillMaxSize().background(Color.Black)) {
+    BoxWithConstraints(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(Color.Black)
+            // Keep the player clear of the status / navigation bars (and of a camera cutout
+            // in landscape, where the bars are hidden)
+            .windowInsetsPadding(if (isLandscape) WindowInsets.displayCutout else WindowInsets.systemBars)
+    ) {
         // In portrait, chat always goes above / below the video instead of beside it
         val isPortrait = maxHeight > maxWidth
         val maxVideoHeight = maxHeight * 0.6f
         val chatFirst = config.chatSide == ChatSide.LEFT
+
+        // Vertical swipe on the player: up in portrait enters fullscreen, down in landscape leaves it.
+        // The player follows the finger; past half the threshold the orientation flips on release.
+        val swipeThresholdPx = with(LocalDensity.current) { 120.dp.toPx() }
+        var swipeOffsetPx by remember { mutableFloatStateOf(0f) }
+        val swipeScope = rememberCoroutineScope()
+        fun swipeProgress() = (kotlin.math.abs(swipeOffsetPx) / swipeThresholdPx).coerceIn(0f, 1.5f)
+        // The rotation landed: drop the gesture transform for the new layout
+        LaunchedEffect(isPortrait) { swipeOffsetPx = 0f }
 
         @Composable
         fun RowScope.TopBar() {
@@ -403,7 +442,58 @@ fun GanymedePlayerScreen(
         // Video with controls on top; `overlayContent` draws between the two (overlay chat)
         @Composable
         fun VideoPlayer(modifier: Modifier, overlayContent: @Composable BoxScope.() -> Unit = {}) {
-            Box(modifier = modifier) {
+            Box(
+                modifier = modifier
+                    // Draw above the chat while the swipe gesture scales the player up
+                    .zIndex(if (swipeOffsetPx != 0f) 1f else 0f)
+                    .graphicsLayer {
+                        val progress = swipeProgress()
+                        if (isPortrait) {
+                            // Swiping up grows the player towards fullscreen
+                            val scale = 1f + 0.12f * progress
+                            scaleX = scale
+                            scaleY = scale
+                            translationY = swipeOffsetPx * 0.35f
+                        } else {
+                            // Swiping down shrinks the player and pulls it down with the finger
+                            val scale = 1f - 0.15f * progress
+                            scaleX = scale
+                            scaleY = scale
+                            translationY = swipeOffsetPx * 0.6f
+                        }
+                    }
+                    .pointerInput(isPortrait, fullscreenController) {
+                        if (fullscreenController == null) return@pointerInput
+                        detectVerticalDragGestures(
+                            onVerticalDrag = { change, dragAmount ->
+                                val limit = swipeThresholdPx * 1.5f
+                                val next = swipeOffsetPx + dragAmount
+                                // Only follow the finger in the direction that changes orientation
+                                swipeOffsetPx = if (isPortrait) next.coerceIn(-limit, 0f) else next.coerceIn(0f, limit)
+                                change.consume()
+                            },
+                            onDragEnd = {
+                                if (swipeProgress() >= 0.5f) {
+                                    // Hold the stretched player until the rotation lands (reset below)
+                                    if (isPortrait) fullscreenController.enterFullscreen() else fullscreenController.exitFullscreen()
+                                    swipeScope.launch {
+                                        delay(800L)
+                                        animate(swipeOffsetPx, 0f) { value, _ -> swipeOffsetPx = value }
+                                    }
+                                } else {
+                                    swipeScope.launch {
+                                        animate(swipeOffsetPx, 0f) { value, _ -> swipeOffsetPx = value }
+                                    }
+                                }
+                            },
+                            onDragCancel = {
+                                swipeScope.launch {
+                                    animate(swipeOffsetPx, 0f) { value, _ -> swipeOffsetPx = value }
+                                }
+                            }
+                        )
+                    }
+            ) {
                 VideoSurface(exoPlayer = exoPlayer, modifier = Modifier.fillMaxSize())
                 overlayContent()
                 PlayerControlsOverlay(
@@ -411,6 +501,10 @@ fun GanymedePlayerScreen(
                     visible = controlsVisible,
                     onVisibleChange = { controlsVisible = it },
                     modifier = Modifier.fillMaxSize(),
+                    isFullscreen = !isPortrait,
+                    onToggleFullscreen = fullscreenController?.let { controller ->
+                        { if (isPortrait) controller.enterFullscreen() else controller.exitFullscreen() }
+                    },
                     topBar = { TopBar() }
                 )
             }

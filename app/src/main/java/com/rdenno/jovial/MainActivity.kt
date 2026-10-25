@@ -3,7 +3,9 @@ package com.rdenno.jovial
 import android.content.Context
 import android.os.Bundle
 import androidx.activity.ComponentActivity
+import androidx.activity.SystemBarStyle
 import androidx.activity.compose.setContent
+import androidx.activity.enableEdgeToEdge
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
@@ -46,6 +48,12 @@ private const val KEY_API_KEY = "api_key"
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        // Draw behind the system bars (the default from Android 15) on every version; screens pad
+        // themselves. The app is always dark, so keep light status / navigation bar icons.
+        enableEdgeToEdge(
+            statusBarStyle = SystemBarStyle.dark(android.graphics.Color.TRANSPARENT),
+            navigationBarStyle = SystemBarStyle.dark(android.graphics.Color.TRANSPARENT)
+        )
         setContent {
             MaterialTheme(colorScheme = darkColorScheme()) {
                 Surface(modifier = Modifier.fillMaxSize()) {
@@ -99,27 +107,32 @@ fun JovialApp(viewModel: PlayerViewModel = viewModel()) {
             viewModel = viewModel,
             onBack = { selectedVod = null }
         )
-    } else if (!isConnected) {
-        StartupConnectionScreen(
-            serverUrlInput = serverUrlInput,
-            onServerUrlChange = { serverUrlInput = it },
-            apiKeyInput = apiKeyInput,
-            onApiKeyChange = { apiKeyInput = it },
-            isConnecting = isConnecting,
-            connectionError = connectionError,
-            onConnect = { triggerConnect() }
-        )
     } else {
-        VodBrowserScreen(
-            serverUrl = viewModel.serverUrl,
-            vods = vods,
-            savedProgress = savedProgress,
-            isRefreshing = isConnecting,
-            connectionError = connectionError,
-            onRefresh = { viewModel.fetchVods() },
-            onChangeServer = { viewModel.disconnect() },
-            onSelectVod = { selectedVod = it }
-        )
+        // The player handles the system bars itself; everything else stays clear of them
+        Box(modifier = Modifier.fillMaxSize().safeDrawingPadding()) {
+            if (!isConnected) {
+                StartupConnectionScreen(
+                    serverUrlInput = serverUrlInput,
+                    onServerUrlChange = { serverUrlInput = it },
+                    apiKeyInput = apiKeyInput,
+                    onApiKeyChange = { apiKeyInput = it },
+                    isConnecting = isConnecting,
+                    connectionError = connectionError,
+                    onConnect = { triggerConnect() }
+                )
+            } else {
+                VodBrowserScreen(
+                    serverUrl = viewModel.serverUrl,
+                    vods = vods,
+                    savedProgress = savedProgress,
+                    isRefreshing = isConnecting,
+                    connectionError = connectionError,
+                    onRefresh = { viewModel.fetchVods() },
+                    onChangeServer = { viewModel.disconnect() },
+                    onSelectVod = { selectedVod = it }
+                )
+            }
+        }
     }
 }
 

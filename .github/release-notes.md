@@ -1,6 +1,7 @@
-- Background playback: the video now shows up as a media player in your notifications and on the lock screen, with play/pause, seek, artwork and title. Playback keeps going when you turn the screen off. Swiping Jovial away from recents or closing the picture-in-picture window stops it. It also pauses when headphones are unplugged or a call comes in.
-- New YouTube-style player controls: tap to show or hide, a large centre play/pause button, 10-second skip buttons, double-tap the left or right side to skip (repeat to add more), and a slim purple seek bar that shows buffered progress and grows while you drag it. The controls fade out after 3 seconds of playback.
-- Portrait mode: chat now goes above or below the video instead of beside it. The swap button and the Chat Position setting switch between top and bottom.
-- Your layout settings (chat mode, side, width, font size, overlay opacity) are now saved and restored the next time you open the app.
+- Portrait mode is no longer fullscreen: the status and navigation bars stay visible and the player sits below the status bar, like YouTube. Landscape is still immersive fullscreen.
+- Swipe up on the video in portrait to go fullscreen (landscape), and swipe down in fullscreen to go back. The player follows your finger while you swipe. Let go before the halfway point to cancel.
+- New fullscreen button next to the time in the player controls. In fullscreen, the back button exits fullscreen first.
+- Fullscreen rotates 180° when you flip your phone, even with auto-rotate turned off. With auto-rotate on, rotating back to portrait leaves fullscreen as usual.
+- The server and VOD list screens no longer draw under the status bar.
 
 Installs over v1.1.0 and later directly. If you're still on v1.0.0, uninstall it first; it was signed with a different key.

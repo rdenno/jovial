@@ -17,6 +17,8 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.FastForward
 import androidx.compose.material.icons.rounded.FastRewind
 import androidx.compose.material.icons.rounded.Forward10
+import androidx.compose.material.icons.rounded.Fullscreen
+import androidx.compose.material.icons.rounded.FullscreenExit
 import androidx.compose.material.icons.rounded.Pause
 import androidx.compose.material.icons.rounded.PlayArrow
 import androidx.compose.material.icons.rounded.Replay
@@ -85,6 +87,8 @@ fun PlayerControlsOverlay(
     visible: Boolean,
     onVisibleChange: (Boolean) -> Unit,
     modifier: Modifier = Modifier,
+    isFullscreen: Boolean = false,
+    onToggleFullscreen: (() -> Unit)? = null,
     topBar: @Composable RowScope.() -> Unit = {}
 ) {
     var playWhenReady by remember(player) { mutableStateOf(player.playWhenReady) }
@@ -279,13 +283,30 @@ fun PlayerControlsOverlay(
                         .padding(horizontal = 12.dp, vertical = 4.dp)
                 ) {
                     val shownMs = scrubMs ?: positionMs
-                    Text(
-                        text = "${formatTime(shownMs)} / ${formatTime(durationMs)}",
-                        color = Color.White,
-                        fontSize = 12.sp,
-                        fontWeight = FontWeight.Medium,
-                        modifier = Modifier.padding(start = 4.dp)
-                    )
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text(
+                            text = "${formatTime(shownMs)} / ${formatTime(durationMs)}",
+                            color = Color.White,
+                            fontSize = 12.sp,
+                            fontWeight = FontWeight.Medium,
+                            modifier = Modifier.padding(start = 4.dp).weight(1f)
+                        )
+                        if (onToggleFullscreen != null) {
+                            IconButton(
+                                onClick = {
+                                    onToggleFullscreen()
+                                    interactions++
+                                },
+                                modifier = Modifier.size(36.dp)
+                            ) {
+                                Icon(
+                                    if (isFullscreen) Icons.Rounded.FullscreenExit else Icons.Rounded.Fullscreen,
+                                    contentDescription = if (isFullscreen) "Exit fullscreen" else "Fullscreen",
+                                    tint = Color.White
+                                )
+                            }
+                        }
+                    }
                     SeekBar(
                         positionMs = shownMs,
                         bufferedMs = bufferedMs,
