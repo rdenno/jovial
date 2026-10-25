@@ -330,6 +330,7 @@ fun GanymedePlayerScreen(
     BoxWithConstraints(modifier = Modifier.fillMaxSize().background(Color.Black)) {
         // In portrait, chat always goes above / below the video instead of beside it
         val isPortrait = maxHeight > maxWidth
+        val maxVideoHeight = maxHeight * 0.6f
         val chatFirst = config.chatSide == ChatSide.LEFT
 
         @Composable
@@ -429,7 +430,7 @@ fun GanymedePlayerScreen(
                     VideoPlayer(
                         Modifier
                             .fillMaxWidth()
-                            .heightIn(max = maxHeight * 0.6f)
+                            .heightIn(max = maxVideoHeight)
                             .aspectRatio(videoAspect.coerceIn(0.5f, 3f))
                     )
                     if (!chatFirst) Chat(Modifier.fillMaxWidth().weight(1f).then(chatBackground))
