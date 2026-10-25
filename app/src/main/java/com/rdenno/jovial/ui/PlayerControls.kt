@@ -3,12 +3,13 @@ package com.rdenno.jovial.ui
 import android.graphics.Color as AndroidColor
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.animateDpAsState
+import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.foundation.background
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
-import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.gestures.waitForUpOrCancellation
 import androidx.compose.foundation.gestures.drag
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.CircleShape
@@ -160,31 +161,55 @@ fun PlayerControlsOverlay(
         interactions++
     }
 
+    fun doubleTapSeek(side: SeekSide) {
+        seekBy(if (side == SeekSide.BACK) -SEEK_STEP_MS else SEEK_STEP_MS)
+        // Repeated taps on the same side add up
+        val previous = seekFeedback
+        val seconds = if (previous?.side == side) previous.seconds + 10 else 10
+        seekFeedback = SeekFeedback(side, seconds, System.nanoTime())
+    }
+
     val showPlayIcon = !playWhenReady || playbackState == Player.STATE_IDLE || playbackState == Player.STATE_ENDED
     val isBuffering = playbackState == Player.STATE_BUFFERING && playWhenReady
 
     Box(
+        // Hand-rolled instead of detectTapGestures: that delays every single tap by the double-tap
+        // timeout. Here a tap toggles the controls immediately; a quick second tap on the left or
+        // right third undoes that toggle and seeks instead, and while the seek ripple is showing,
+        // further single taps on the same side keep seeking (like YouTube).
         modifier = modifier.pointerInput(player) {
-            detectTapGestures(
-                onTap = { currentOnVisibleChange(!currentVisible) },
-                onDoubleTap = { offset ->
-                    val third = size.width / 3f
-                    val side = when {
-                        offset.x < third -> SeekSide.BACK
-                        offset.x > third * 2 -> SeekSide.FORWARD
-                        else -> null
-                    }
-                    if (side == null) {
-                        togglePlay()
-                        return@detectTapGestures
-                    }
-                    seekBy(if (side == SeekSide.BACK) -SEEK_STEP_MS else SEEK_STEP_MS)
-                    // Repeated double-taps on the same side add up, like YouTube
-                    val previous = seekFeedback
-                    val seconds = if (previous?.side == side) previous.seconds + 10 else 10
-                    seekFeedback = SeekFeedback(side, seconds, System.nanoTime())
+            var lastTapUptime = 0L
+            var lastTapPosition = Offset.Zero
+            var visibleBeforeTap = false
+            awaitEachGesture {
+                awaitFirstDown()
+                val up = waitForUpOrCancellation() ?: return@awaitEachGesture
+                up.consume()
+                val third = size.width / 3f
+                val side = when {
+                    up.position.x < third -> SeekSide.BACK
+                    up.position.x > third * 2 -> SeekSide.FORWARD
+                    else -> null
                 }
-            )
+                val isDoubleTap = up.uptimeMillis - lastTapUptime < viewConfiguration.doubleTapTimeoutMillis &&
+                    (up.position - lastTapPosition).getDistance() < 100.dp.toPx()
+                val continuingSeek = side != null && seekFeedback?.side == side
+
+                when {
+                    continuingSeek -> doubleTapSeek(side!!)
+                    isDoubleTap -> {
+                        currentOnVisibleChange(visibleBeforeTap)
+                        if (side == null) togglePlay() else doubleTapSeek(side)
+                    }
+                    else -> {
+                        visibleBeforeTap = currentVisible
+                        currentOnVisibleChange(!currentVisible)
+                    }
+                }
+                // A third tap starts a new pair rather than counting as another double-tap
+                lastTapUptime = if (isDoubleTap) 0L else up.uptimeMillis
+                lastTapPosition = up.position
+            }
         }
     ) {
         // Double-tap seek ripple
@@ -224,8 +249,8 @@ fun PlayerControlsOverlay(
 
         AnimatedVisibility(
             visible = visible,
-            enter = fadeIn(),
-            exit = fadeOut(),
+            enter = fadeIn(tween(120)),
+            exit = fadeOut(tween(200)),
             modifier = Modifier.fillMaxSize()
         ) {
             Box(
