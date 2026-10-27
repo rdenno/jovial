@@ -239,6 +239,9 @@ interface GanymedeApi {
             .build()
             private set
 
+        var mediaClient: OkHttpClient = activeClient
+            private set
+
         fun normalizeServerUrl(rawInput: String): String {
             var cleaned = rawInput.trim()
             if (cleaned.isEmpty()) return ""
@@ -277,6 +280,13 @@ interface GanymedeApi {
                 }.build()
 
             activeClient = client
+            // Media streams skip the disk cache: OkHttp would otherwise copy whole multi-GB video
+            // responses into it while they play. Shares the connection pool and API key header.
+            mediaClient = client.newBuilder()
+                .cache(null)
+                .readTimeout(30, TimeUnit.SECONDS)
+                .retryOnConnectionFailure(true)
+                .build()
 
             return Retrofit.Builder()
                 .baseUrl(baseUrl.trimEnd('/') + "/")

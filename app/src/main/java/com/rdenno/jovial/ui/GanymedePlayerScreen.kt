@@ -76,6 +76,7 @@ import androidx.media3.datasource.okhttp.OkHttpDataSource
 import androidx.media3.exoplayer.DefaultLoadControl
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
+import androidx.media3.exoplayer.upstream.DefaultLoadErrorHandlingPolicy
 import androidx.media3.session.CacheBitmapLoader
 import androidx.media3.session.MediaSession
 import coil.ImageLoader
@@ -125,21 +126,34 @@ fun GanymedePlayerScreen(
             .build()
     }
 
-    // Initialize ExoPlayer with optimized buffer durations and OkHttpDataSource for fast video start
+    // Initialize ExoPlayer with a large read-ahead buffer (rides out network drops) and a quick start
     val exoPlayer = remember {
-        val dataSourceFactory = OkHttpDataSource.Factory(GanymedeApi.activeClient)
+        val dataSourceFactory = OkHttpDataSource.Factory(GanymedeApi.mediaClient)
+        // The buffer lives on the Java heap, so cap it at a share of what this device allows
+        val bufferBytes = (Runtime.getRuntime().maxMemory() * 0.4).toLong()
+            .coerceIn(32L * 1024 * 1024, 256L * 1024 * 1024)
+            .toInt()
         val loadControl = DefaultLoadControl.Builder()
             .setBufferDurationsMs(
-                /* minBufferMs = */ 15_000,
-                /* maxBufferMs = */ 50_000,
+                // Keep 2-3 minutes buffered ahead: top up whenever it drops below 2 minutes
+                /* minBufferMs = */ 120_000,
+                /* maxBufferMs = */ 180_000,
                 /* bufferForPlaybackMs = */ 500, // Starts playback in 0.5s instead of waiting 2.5-5s
-                /* bufferForPlaybackAfterRebufferMs = */ 1_000
+                // After a stall, wait for a few seconds of data so it doesn't stutter straight back
+                /* bufferForPlaybackAfterRebufferMs = */ 3_000
             )
-            .setPrioritizeTimeOverSizeThresholds(true)
+            // Stop reading ahead at the memory cap even if under 2 minutes (very high bitrates)
+            .setTargetBufferBytes(bufferBytes)
+            .setPrioritizeTimeOverSizeThresholds(false)
             .build()
 
+        // Keep retrying through a dropped connection (with backoff) instead of failing playback
+        val mediaSourceFactory = DefaultMediaSourceFactory(context)
+            .setDataSourceFactory(dataSourceFactory)
+            .setLoadErrorHandlingPolicy(DefaultLoadErrorHandlingPolicy(/* minimumLoadableRetryCount = */ 20))
+
         ExoPlayer.Builder(context)
-            .setMediaSourceFactory(DefaultMediaSourceFactory(context).setDataSourceFactory(dataSourceFactory))
+            .setMediaSourceFactory(mediaSourceFactory)
             .setLoadControl(loadControl)
             // Pause for calls / other media, and when headphones are unplugged
             .setAudioAttributes(
