@@ -15,6 +15,7 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.rounded.ErrorOutline
 import androidx.compose.material.icons.rounded.FastForward
 import androidx.compose.material.icons.rounded.FastRewind
 import androidx.compose.material.icons.rounded.Forward10
@@ -28,6 +29,7 @@ import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -98,6 +100,7 @@ fun PlayerControlsOverlay(
     var positionMs by remember(player) { mutableLongStateOf(player.currentPosition) }
     var bufferedMs by remember(player) { mutableLongStateOf(player.bufferedPosition) }
     var durationMs by remember(player) { mutableLongStateOf(0L) }
+    var playerError by remember(player) { mutableStateOf(player.playerError) }
     var scrubMs by remember { mutableStateOf<Long?>(null) }
     // Bumped on every interaction so the auto-hide timer restarts
     var interactions by remember { mutableIntStateOf(0) }
@@ -110,6 +113,7 @@ fun PlayerControlsOverlay(
                 isPlaying = player.isPlaying
                 playbackState = player.playbackState
                 durationMs = player.duration.takeIf { it != C.TIME_UNSET && it > 0 } ?: 0L
+                playerError = player.playerError
             }
         }
         player.addListener(listener)
@@ -151,6 +155,11 @@ fun PlayerControlsOverlay(
 
     fun togglePlay() {
         when {
+            // A failed / idle player ignores play() until prepared again
+            playbackState == Player.STATE_IDLE -> {
+                player.prepare()
+                player.play()
+            }
             playbackState == Player.STATE_ENDED -> {
                 player.seekTo(0L)
                 player.play()
@@ -344,6 +353,30 @@ fun PlayerControlsOverlay(
                             interactions++
                         }
                     )
+                }
+            }
+        }
+
+        // Playback failed (after automatic retries): say so instead of silently doing nothing
+        playerError?.let { error ->
+            Column(
+                modifier = Modifier
+                    .align(Alignment.Center)
+                    .background(Color.Black.copy(alpha = 0.75f), RoundedCornerShape(12.dp))
+                    .padding(horizontal = 20.dp, vertical = 14.dp),
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.spacedBy(6.dp)
+            ) {
+                Icon(Icons.Rounded.ErrorOutline, contentDescription = null, tint = Color.White)
+                Text("Couldn't play this video", color = Color.White, fontSize = 14.sp, fontWeight = FontWeight.Medium)
+                Text(error.errorCodeName, color = Color.White.copy(alpha = 0.6f), fontSize = 11.sp)
+                TextButton(
+                    onClick = {
+                        player.prepare()
+                        player.play()
+                    }
+                ) {
+                    Text("Retry", color = Accent, fontWeight = FontWeight.SemiBold)
                 }
             }
         }

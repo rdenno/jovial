@@ -1,6 +1,7 @@
-- Fixes buffering during playback. The video stream went through the same disk cache the app uses for emotes. That meant every byte of video was also written to storage while playing, which could stall playback even on a fast connection.
-- The player now buffers 2-3 minutes ahead, up from under a minute, so short network drops shouldn't interrupt playback. The buffer has a memory cap, so very high bitrates buffer less.
-- After a stall, playback waits for a few seconds of video before resuming, so it doesn't stop again straight away.
-- A dropped connection now keeps retrying for about a minute and a half before giving up.
+- Fixes a video that wouldn't play again after you returned to the app later. After a long pause the server connection is usually gone, and a player that had hit an error ignored the play button. The player now reconnects at the same spot when you resume after more than 2 minutes paused, or when you press play after an error. This also works from the notification or headphone buttons.
+- If loading fails, it retries automatically a few times. If it still can't play, you'll see a "Couldn't play this video" message with a Retry button instead of a play button that does nothing.
+- If buffering goes 20 seconds with no data arriving, the connection is reopened automatically.
+- A saved position at or past the end of a video now restarts it from the beginning.
+- Clears out leftover video data that older versions could leave in the app's cache. This was why clearing the cache used to help.
 
 Installs over v1.1.0 and later directly. If you're still on v1.0.0, uninstall it first; it was signed with a different key.

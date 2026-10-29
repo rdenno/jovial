@@ -219,6 +219,13 @@ fun GanymedePlayerScreen(
         Rational((videoAspect.coerceIn(1f / 2.39f, 2.39f) * 10_000).toInt(), 10_000)
     }
 
+    // Reloads the stream after long pauses, errors and stalls so the video never gets stuck
+    val playbackRecovery = remember(exoPlayer) { PlaybackRecovery(exoPlayer) }
+    DisposableEffect(playbackRecovery) {
+        playbackRecovery.attach()
+        onDispose { playbackRecovery.detach() }
+    }
+
     DisposableEffect(exoPlayer) {
         val listener = object : Player.Listener {
             override fun onIsPlayingChanged(playing: Boolean) {
@@ -329,6 +336,7 @@ fun GanymedePlayerScreen(
             .setMediaMetadata(metadata)
             .build()
         exoPlayer.setMediaItem(mediaItem, startPos)
+        playbackRecovery.onNewMediaLoaded()
         exoPlayer.prepare()
         exoPlayer.playWhenReady = true
 

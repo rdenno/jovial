@@ -7,6 +7,7 @@ import com.rdenno.jovial.network.GanymedeApi
 import com.rdenno.jovial.network.GanymedeEmote
 import com.rdenno.jovial.network.GanymedeVod
 import com.rdenno.jovial.network.ThirdPartyEmoteFetcher
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.async
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -104,7 +105,10 @@ class PlayerViewModel : ViewModel() {
         sharedPrefs = prefs
         GanymedeApi.cacheDir = cacheDir
         loadAllSavedProgress()
-        if (firstInit) loadLayoutConfig()
+        if (firstInit) {
+            loadLayoutConfig()
+            viewModelScope.launch(Dispatchers.IO) { GanymedeApi.purgeCachedMedia() }
+        }
     }
 
     private fun loadLayoutConfig() {

@@ -242,6 +242,22 @@ interface GanymedeApi {
         var mediaClient: OkHttpClient = activeClient
             private set
 
+        /**
+         * Older versions streamed video through the shared disk cache, which could keep partial
+         * or stale video responses around and break playback of that video. Drops them.
+         */
+        fun purgeCachedMedia() {
+            val cache = sharedCache() ?: return
+            val mediaExtensions = listOf(".mp4", ".m4s", ".m3u8", ".ts", ".mkv", ".webm", ".mov")
+            runCatching {
+                val urls = cache.urls()
+                while (urls.hasNext()) {
+                    val path = urls.next().substringBefore('?').lowercase()
+                    if (mediaExtensions.any { path.endsWith(it) }) urls.remove()
+                }
+            }
+        }
+
         fun normalizeServerUrl(rawInput: String): String {
             var cleaned = rawInput.trim()
             if (cleaned.isEmpty()) return ""
@@ -284,7 +300,8 @@ interface GanymedeApi {
             // responses into it while they play. Shares the connection pool and API key header.
             mediaClient = client.newBuilder()
                 .cache(null)
-                .readTimeout(30, TimeUnit.SECONDS)
+                // Short enough that a dead connection is noticed and retried quickly
+                .readTimeout(15, TimeUnit.SECONDS)
                 .retryOnConnectionFailure(true)
                 .build()
 
