@@ -12,8 +12,8 @@ android {
         applicationId = "com.rdenno.jovial"
         minSdk = 24
         targetSdk = 35
-        versionCode = 10
-        versionName = "1.5.4"
+        versionCode = 11
+        versionName = "1.5.5"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }

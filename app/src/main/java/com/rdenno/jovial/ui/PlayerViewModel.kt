@@ -245,14 +245,23 @@ class PlayerViewModel : ViewModel() {
     }
 
     /**
-     * Describes what the server actually returns for a media URL (status, content type and the
-     * first bytes), shown when the player can't recognise the response as video.
+     * Describes what the server actually returns for a media URL (status, headers and the first
+     * bytes), shown when the player can't recognise the response as video. Sends the same
+     * request the player's first read does: from the start, no Range header.
      */
     suspend fun describeMediaResponse(url: String): String = withContext(Dispatchers.IO) {
         runCatching {
-            val request = Request.Builder().url(url).header("Range", "bytes=0-1023").build()
+            val request = Request.Builder()
+                .url(url)
+                .header("Accept-Encoding", "identity")
+                .header("Icy-MetaData", "1")
+                .build()
             GanymedeApi.mediaClient.newCall(request).execute().use { response ->
-                val type = response.header("Content-Type") ?: "no content type"
+                val type = listOfNotNull(
+                    response.header("Content-Type") ?: "no content type",
+                    response.header("Content-Encoding")?.let { "encoding $it" },
+                    response.header("Content-Length")?.let { "$it bytes" }
+                ).joinToString(" · ")
                 val start = response.peekBody(120).string()
                     .map { if (it.isLetterOrDigit() || it in " <>/=:;,.-_\"'!?{}[]()") it else '·' }
                     .joinToString("")

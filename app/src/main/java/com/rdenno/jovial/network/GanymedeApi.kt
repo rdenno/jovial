@@ -254,6 +254,11 @@ interface GanymedeApi {
         var mediaClient: OkHttpClient = activeClient
             private set
 
+        /** Drops every pooled server connection so the next request starts on a fresh one. */
+        fun resetMediaConnections() {
+            mediaClient.connectionPool.evictAll()
+        }
+
         /**
          * Older versions streamed video through the shared disk cache, which could keep partial
          * or stale video responses around and break playback of that video. Drops them.

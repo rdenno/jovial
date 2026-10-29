@@ -129,7 +129,11 @@ fun GanymedePlayerScreen(
 
     // Initialize ExoPlayer with a large read-ahead buffer (rides out network drops) and a quick start
     val exoPlayer = remember {
+        // Ask for the raw bytes: without a Range header OkHttp would otherwise request gzip, and a
+        // server / proxy compressing (or caching a compressed copy of) the video can hand the
+        // player data it can't recognise, while ranged reads of the same file work fine
         val dataSourceFactory = OkHttpDataSource.Factory(GanymedeApi.mediaClient)
+            .setDefaultRequestProperties(mapOf("Accept-Encoding" to "identity"))
         // The buffer lives on the Java heap, so cap it at a share of what this device allows
         val bufferBytes = (Runtime.getRuntime().maxMemory() * 0.4).toLong()
             .coerceIn(32L * 1024 * 1024, 256L * 1024 * 1024)
@@ -233,6 +237,7 @@ fun GanymedePlayerScreen(
     // show what the server actually returned.
     val sourceScope = rememberCoroutineScope()
     val triedSources = remember(vod.id) { mutableSetOf<String>() }
+    var freshConnectionRetried by remember(vod.id) { mutableStateOf(false) }
     var sourceErrorDetail by remember(vod.id) { mutableStateOf<String?>(null) }
     val useRenderedChatVideo by rememberUpdatedState(config.useRenderedChatVideo)
     DisposableEffect(exoPlayer, vod.id) {
@@ -242,19 +247,30 @@ fun GanymedePlayerScreen(
                 val failedItem = exoPlayer.currentMediaItem ?: return
                 val failedUrl = failedItem.localConfiguration?.uri?.toString() ?: return
                 val position = exoPlayer.currentPosition
-                triedSources += failedUrl
+                val cause = generateSequence(error.cause) { it.cause }.lastOrNull()
+                val playerMessage = cause?.let { "${it.javaClass.simpleName}: ${it.message.orEmpty()}" }
                 sourceScope.launch {
+                    // Start over on brand-new connections, as a force stop would
+                    GanymedeApi.resetMediaConnections()
                     val fresh = viewModel.fetchVod(vod.id) ?: vod
-                    val next = listOfNotNull(
-                        fresh.getFullVideoUrl(viewModel.serverUrl, useRenderedChatVideo),
-                        fresh.getHlsVideoUrl(viewModel.serverUrl),
-                        vod.getHlsVideoUrl(viewModel.serverUrl)
-                    ).firstOrNull { it !in triedSources }
+                    val next = if (!freshConnectionRetried) {
+                        // First, the same file again on fresh connections (or its new location)
+                        freshConnectionRetried = true
+                        fresh.getFullVideoUrl(viewModel.serverUrl, useRenderedChatVideo)
+                    } else {
+                        triedSources += failedUrl
+                        listOfNotNull(
+                            fresh.getFullVideoUrl(viewModel.serverUrl, useRenderedChatVideo),
+                            fresh.getHlsVideoUrl(viewModel.serverUrl),
+                            vod.getHlsVideoUrl(viewModel.serverUrl)
+                        ).firstOrNull { it !in triedSources }
+                    }
                     if (next != null) {
                         exoPlayer.setMediaItem(failedItem.buildUpon().setUri(next).build(), position)
                         exoPlayer.prepare()
                     } else {
-                        sourceErrorDetail = viewModel.describeMediaResponse(failedUrl)
+                        val response = viewModel.describeMediaResponse(failedUrl)
+                        sourceErrorDetail = listOfNotNull(response, playerMessage).joinToString("\n")
                     }
                 }
             }

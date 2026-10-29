@@ -376,7 +376,7 @@ fun PlayerControlsOverlay(
                         errorDetail,
                         color = Color.White.copy(alpha = 0.6f),
                         fontSize = 11.sp,
-                        maxLines = 4,
+                        maxLines = 8,
                         modifier = Modifier.widthIn(max = 320.dp)
                     )
                 }
