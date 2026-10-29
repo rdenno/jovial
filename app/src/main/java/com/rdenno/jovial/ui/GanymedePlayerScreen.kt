@@ -68,6 +68,7 @@ import androidx.media3.common.AudioAttributes
 import androidx.media3.common.C
 import androidx.media3.common.MediaItem
 import androidx.media3.common.MediaMetadata
+import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
 import androidx.media3.common.VideoSize
 import androidx.media3.common.util.UnstableApi
@@ -224,6 +225,46 @@ fun GanymedePlayerScreen(
     DisposableEffect(playbackRecovery) {
         playbackRecovery.attach()
         onDispose { playbackRecovery.detach() }
+    }
+
+    // When the server answers with something that isn't video (the file moved, e.g. once an
+    // archive finishes processing, or an error page), re-fetch this VOD's current file paths and
+    // switch to whichever URL is new, falling back to the HLS rendition. If nothing new is left,
+    // show what the server actually returned.
+    val sourceScope = rememberCoroutineScope()
+    val triedSources = remember(vod.id) { mutableSetOf<String>() }
+    var sourceErrorDetail by remember(vod.id) { mutableStateOf<String?>(null) }
+    val useRenderedChatVideo by rememberUpdatedState(config.useRenderedChatVideo)
+    DisposableEffect(exoPlayer, vod.id) {
+        val listener = object : Player.Listener {
+            override fun onPlayerError(error: PlaybackException) {
+                if (!isSourceError(error)) return
+                val failedItem = exoPlayer.currentMediaItem ?: return
+                val failedUrl = failedItem.localConfiguration?.uri?.toString() ?: return
+                val position = exoPlayer.currentPosition
+                triedSources += failedUrl
+                sourceScope.launch {
+                    val fresh = viewModel.fetchVod(vod.id) ?: vod
+                    val next = listOfNotNull(
+                        fresh.getFullVideoUrl(viewModel.serverUrl, useRenderedChatVideo),
+                        fresh.getHlsVideoUrl(viewModel.serverUrl),
+                        vod.getHlsVideoUrl(viewModel.serverUrl)
+                    ).firstOrNull { it !in triedSources }
+                    if (next != null) {
+                        exoPlayer.setMediaItem(failedItem.buildUpon().setUri(next).build(), position)
+                        exoPlayer.prepare()
+                    } else {
+                        sourceErrorDetail = viewModel.describeMediaResponse(failedUrl)
+                    }
+                }
+            }
+
+            override fun onPlaybackStateChanged(playbackState: Int) {
+                if (playbackState == Player.STATE_READY) sourceErrorDetail = null
+            }
+        }
+        exoPlayer.addListener(listener)
+        onDispose { exoPlayer.removeListener(listener) }
     }
 
     DisposableEffect(exoPlayer) {
@@ -524,6 +565,7 @@ fun GanymedePlayerScreen(
                     onVisibleChange = { controlsVisible = it },
                     modifier = Modifier.fillMaxSize(),
                     isFullscreen = !isPortrait,
+                    errorDetail = sourceErrorDetail,
                     onToggleFullscreen = fullscreenController?.let { controller ->
                         { if (isPortrait) controller.enterFullscreen() else controller.exitFullscreen() }
                     },

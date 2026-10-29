@@ -1,7 +1,5 @@
-- Fixes a video that wouldn't play again after you returned to the app later. After a long pause the server connection is usually gone, and a player that had hit an error ignored the play button. The player now reconnects at the same spot when you resume after more than 2 minutes paused, or when you press play after an error. This also works from the notification or headphone buttons.
-- If loading fails, it retries automatically a few times. If it still can't play, you'll see a "Couldn't play this video" message with a Retry button instead of a play button that does nothing.
-- If buffering goes 20 seconds with no data arriving, the connection is reopened automatically.
-- A saved position at or past the end of a video now restarts it from the beginning.
-- Clears out leftover video data that older versions could leave in the app's cache. This was why clearing the cache used to help.
+- Fixes "Couldn't play this video" (ERROR_CODE_PARSING_CONTAINER_UNSUPPORTED) on a video you'd been watching. This error means the server sent back something that isn't video, usually because the file has moved since the app last loaded the video list. The app now fetches the video's current file location from Ganymede and switches to it at the same spot. If that fails too, it tries the HLS version when the server has one.
+- VOD details are always fetched fresh from the server instead of possibly coming from the app's disk cache. Emotes still use the cache.
+- If a video still can't play, the error now shows what the server actually returned: the HTTP status, the type of content, and the first few characters. This makes it much easier to see what's wrong on the server side.
 
 Installs over v1.1.0 and later directly. If you're still on v1.0.0, uninstall it first; it was signed with a different key.

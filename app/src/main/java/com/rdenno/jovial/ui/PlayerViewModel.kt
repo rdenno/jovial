@@ -16,6 +16,8 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.flow.updateAndGet
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import okhttp3.Request
 import java.io.File
 import kotlin.math.abs
 
@@ -234,6 +236,30 @@ class PlayerViewModel : ViewModel() {
                     "Failed to refresh VODs: ${err.localizedMessage ?: err.javaClass.simpleName}"
             }
         }
+    }
+
+    /** Fresh details for one VOD from the server, or null if they can't be fetched. */
+    suspend fun fetchVod(vodId: String): GanymedeVod? {
+        val currentApi = api ?: return null
+        return runCatching { currentApi.getVod(vodId).data }.getOrNull()
+    }
+
+    /**
+     * Describes what the server actually returns for a media URL (status, content type and the
+     * first bytes), shown when the player can't recognise the response as video.
+     */
+    suspend fun describeMediaResponse(url: String): String = withContext(Dispatchers.IO) {
+        runCatching {
+            val request = Request.Builder().url(url).header("Range", "bytes=0-1023").build()
+            GanymedeApi.mediaClient.newCall(request).execute().use { response ->
+                val type = response.header("Content-Type") ?: "no content type"
+                val start = response.peekBody(120).string()
+                    .map { if (it.isLetterOrDigit() || it in " <>/=:;,.-_\"'!?{}[]()") it else '·' }
+                    .joinToString("")
+                    .trim()
+                "HTTP ${response.code} · $type · \"$start\""
+            }
+        }.getOrElse { "Request failed: ${it.javaClass.simpleName} ${it.message.orEmpty()}" }
     }
 
     fun disconnect() {

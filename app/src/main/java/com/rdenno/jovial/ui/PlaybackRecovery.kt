@@ -24,6 +24,15 @@ private const val MAX_AUTO_RETRIES = 3
  * - a playback error occurs (a few automatic retries, then the UI shows a retry button),
  * - buffering stalls with no data arriving.
  */
+/** The server sent something other than playable video (missing / moved file, error page). */
+fun isSourceError(error: PlaybackException): Boolean = error.errorCode in setOf(
+    PlaybackException.ERROR_CODE_PARSING_CONTAINER_UNSUPPORTED,
+    PlaybackException.ERROR_CODE_PARSING_CONTAINER_MALFORMED,
+    PlaybackException.ERROR_CODE_IO_BAD_HTTP_STATUS,
+    PlaybackException.ERROR_CODE_IO_FILE_NOT_FOUND,
+    PlaybackException.ERROR_CODE_IO_INVALID_HTTP_CONTENT_TYPE
+)
+
 class PlaybackRecovery(private val player: ExoPlayer) : Player.Listener {
     private val handler = Handler(Looper.getMainLooper())
     private var pausedAtMs = 0L
@@ -92,6 +101,8 @@ class PlaybackRecovery(private val player: ExoPlayer) : Player.Listener {
     }
 
     override fun onPlayerError(error: PlaybackException) {
+        // Reloading the same URL can't fix these; the player screen refreshes the source instead
+        if (isSourceError(error)) return
         if (autoRetries < MAX_AUTO_RETRIES) {
             autoRetries++
             handler.postDelayed({ reload() }, 1_500L * autoRetries)

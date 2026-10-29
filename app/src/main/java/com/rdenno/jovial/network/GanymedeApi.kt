@@ -7,6 +7,7 @@ import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.withContext
 import okhttp3.Cache
+import okhttp3.CacheControl
 import okhttp3.HttpUrl
 import okhttp3.Interceptor
 import okhttp3.OkHttpClient
@@ -62,6 +63,10 @@ data class GanymedeVod(
         }
         return buildMediaUrl(baseUrl, rawPath)
     }
+
+    /** The HLS rendition, when the server has one; a fallback if the main file won't play. */
+    fun getHlsVideoUrl(baseUrl: String): String? =
+        videoHlsPath?.takeIf { it.isNotBlank() }?.let { buildMediaUrl(baseUrl, it) }
 
     fun getFullThumbnailUrl(baseUrl: String): String {
         val rawPath = if (!webThumbnailPath.isNullOrBlank()) {
@@ -176,6 +181,13 @@ interface GanymedeApi {
     @GET("/api/v1/vod")
     suspend fun getAllVods(): GanymedeResponse<List<GanymedeVod>>
 
+    // Current details for one VOD (its file paths can change after the list was loaded)
+    @GET("/api/v1/vod/{id}")
+    suspend fun getVod(
+        @Path("id") vodId: String,
+        @Query("with_channel") withChannel: Boolean = true
+    ): GanymedeResponse<GanymedeVod>
+
     // Fetches N comments right before a seek timestamp (Ganymede uses 'start' query param)
     @GET("/api/v1/vod/{id}/chat/seek")
     suspend fun getSeekChat(
@@ -281,6 +293,16 @@ interface GanymedeApi {
                 .followSslRedirects(true)
                 .connectionPool(okhttp3.ConnectionPool(8, 5, TimeUnit.MINUTES))
                 .cache(sharedCache())
+                // Only the (huge, immutable) emote catalogs come from the disk cache; everything
+                // else, like VOD details and file paths, must always be fresh from the server
+                .addInterceptor { chain ->
+                    val request = chain.request()
+                    if (request.url.encodedPath.endsWith("/chat/emotes")) {
+                        chain.proceed(request)
+                    } else {
+                        chain.proceed(request.newBuilder().cacheControl(CacheControl.FORCE_NETWORK).build())
+                    }
+                }
                 .addNetworkInterceptor(forceCacheInterceptor(7 * 24 * 3600) { url ->
                     url.encodedPath.endsWith("/chat/emotes")
                 })

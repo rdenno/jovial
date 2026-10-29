@@ -92,6 +92,7 @@ fun PlayerControlsOverlay(
     modifier: Modifier = Modifier,
     isFullscreen: Boolean = false,
     onToggleFullscreen: (() -> Unit)? = null,
+    errorDetail: String? = null,
     topBar: @Composable RowScope.() -> Unit = {}
 ) {
     var playWhenReady by remember(player) { mutableStateOf(player.playWhenReady) }
@@ -370,6 +371,15 @@ fun PlayerControlsOverlay(
                 Icon(Icons.Rounded.ErrorOutline, contentDescription = null, tint = Color.White)
                 Text("Couldn't play this video", color = Color.White, fontSize = 14.sp, fontWeight = FontWeight.Medium)
                 Text(error.errorCodeName, color = Color.White.copy(alpha = 0.6f), fontSize = 11.sp)
+                if (errorDetail != null) {
+                    Text(
+                        errorDetail,
+                        color = Color.White.copy(alpha = 0.6f),
+                        fontSize = 11.sp,
+                        maxLines = 4,
+                        modifier = Modifier.widthIn(max = 320.dp)
+                    )
+                }
                 TextButton(
                     onClick = {
                         player.prepare()
