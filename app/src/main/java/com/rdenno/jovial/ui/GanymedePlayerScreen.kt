@@ -152,9 +152,9 @@ fun GanymedePlayerScreen(
             .setPrioritizeTimeOverSizeThresholds(false)
             .build()
 
-        // Keep retrying through a dropped connection (with backoff) instead of failing playback
-        val mediaSourceFactory = DefaultMediaSourceFactory(context)
-            .setDataSourceFactory(dataSourceFactory)
+        // Picks the correct index in fragmented MP4s with several (see SegmentIndexFix), and keeps
+        // retrying through a dropped connection (with backoff) instead of failing playback
+        val mediaSourceFactory = DefaultMediaSourceFactory(dataSourceFactory, SegmentIndexFixExtractorsFactory())
             .setLoadErrorHandlingPolicy(DefaultLoadErrorHandlingPolicy(/* minimumLoadableRetryCount = */ 20))
 
         ExoPlayer.Builder(context)
