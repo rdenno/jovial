@@ -343,9 +343,12 @@ fun GanymedePlayerScreen(
         onDispose {
             activity.removeOnUserLeaveHintListener(userLeaveListener)
             activity.removeOnPictureInPictureModeChangedListener(pipModeListener)
-            // Leaving the player must not auto-enter PiP from the VOD list
+            // Leaving the player must not auto-enter PiP from the VOD list. This also runs while
+            // the activity is being destroyed, when the system rejects the call, so ignore that
             if (pipSupported && Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                activity.setPictureInPictureParams(buildPipParams(pipAspect, autoEnter = false))
+                runCatching {
+                    activity.setPictureInPictureParams(buildPipParams(pipAspect, autoEnter = false))
+                }
             }
         }
     }
