@@ -4,7 +4,7 @@ import android.net.Uri
 import com.google.gson.annotations.SerializedName
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
-import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.supervisorScope
 import kotlinx.coroutines.withContext
 import okhttp3.Cache
 import okhttp3.CacheControl
@@ -360,7 +360,9 @@ object ThirdPartyEmoteFetcher {
 
     suspend fun fetchAllThirdPartyEmotes(twitchChannelId: String?): List<GanymedeEmote> =
         withContext(Dispatchers.IO) {
-            coroutineScope {
+            // supervisorScope so one failed fetch (e.g. a DNS error) only surfaces at its await()
+            // instead of cancelling the scope and crashing the caller
+            supervisorScope {
                 val jobs = mutableListOf(
                     async { fetch7TVGlobal() },
                     async { fetchBTTVGlobal() },
