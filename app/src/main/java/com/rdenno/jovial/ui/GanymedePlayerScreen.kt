@@ -64,7 +64,6 @@ import androidx.core.app.PictureInPictureModeChangedInfo
 import androidx.core.util.Consumer
 import androidx.core.view.WindowInsetsControllerCompat
 import androidx.lifecycle.Lifecycle
-import androidx.media3.common.AudioAttributes
 import androidx.media3.common.C
 import androidx.media3.common.MediaItem
 import androidx.media3.common.MediaMetadata
@@ -160,19 +159,17 @@ fun GanymedePlayerScreen(
         ExoPlayer.Builder(context)
             .setMediaSourceFactory(mediaSourceFactory)
             .setLoadControl(loadControl)
-            // Pause for calls / other media, and when headphones are unplugged
-            .setAudioAttributes(
-                AudioAttributes.Builder()
-                    .setUsage(C.USAGE_MEDIA)
-                    .setContentType(C.AUDIO_CONTENT_TYPE_MOVIE)
-                    .build(),
-                /* handleAudioFocus = */ true
-            )
+            // Pause for calls / other media, and when headphones are unplugged. CallAwarePlayer
+            // still lets the user start playback during a call
+            .setAudioAttributes(MEDIA_AUDIO_ATTRIBUTES, /* handleAudioFocus = */ true)
             .setHandleAudioBecomingNoisy(true)
             // Keep the CPU and Wi-Fi awake so playback continues with the screen off
             .setWakeMode(C.WAKE_MODE_NETWORK)
             .build()
     }
+
+    // Playback is started through this wrapper so it also works during a call
+    val player = remember(exoPlayer) { CallAwarePlayer(exoPlayer, context) }
 
     // Release the player when leaving the screen
     DisposableEffect(Unit) {
@@ -187,7 +184,7 @@ fun GanymedePlayerScreen(
     // play/pause button; PlaybackService keeps it alive in the background.
     // Declared after the effect above so it is disposed (released) before the player is.
     DisposableEffect(exoPlayer) {
-        val session = buildMediaSession(context, exoPlayer)
+        val session = buildMediaSession(context, player)
         PlaybackService.attach(context, session)
         onDispose {
             PlaybackService.detach(context, session)
@@ -398,7 +395,7 @@ fun GanymedePlayerScreen(
         exoPlayer.setMediaItem(mediaItem, startPos)
         playbackRecovery.onNewMediaLoaded()
         exoPlayer.prepare()
-        exoPlayer.playWhenReady = true
+        player.playWhenReady = true
 
         // Trigger chat immediately so chat appears in parallel with video start!
         viewModel.onPlaybackPositionUpdate(vod.id, startPos / 1000.0)
@@ -579,7 +576,7 @@ fun GanymedePlayerScreen(
                 VideoSurface(exoPlayer = exoPlayer, modifier = Modifier.fillMaxSize())
                 overlayContent()
                 PlayerControlsOverlay(
-                    player = exoPlayer,
+                    player = player,
                     visible = controlsVisible,
                     onVisibleChange = { controlsVisible = it },
                     modifier = Modifier.fillMaxSize(),
