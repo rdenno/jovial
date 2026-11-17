@@ -436,9 +436,9 @@ fun GanymedePlayerScreen(
         modifier = Modifier
             .fillMaxSize()
             .background(Color.Black)
-            // Keep the player clear of the status / navigation bars (and of a camera cutout
-            // in landscape, where the bars are hidden)
-            .windowInsetsPadding(if (isLandscape) WindowInsets.displayCutout else WindowInsets.systemBars)
+            // Portrait keeps the status / navigation bars, so stay clear of them. Landscape is
+            // immersive and fills the whole screen, drawing under the camera cutout too
+            .then(if (isLandscape) Modifier else Modifier.windowInsetsPadding(WindowInsets.systemBars))
     ) {
         // In portrait, chat always goes above / below the video instead of beside it
         val isPortrait = maxHeight > maxWidth

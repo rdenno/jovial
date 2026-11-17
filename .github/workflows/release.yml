@@ -31,6 +31,15 @@ jobs:
 
       - uses: gradle/actions/setup-gradle@v4
 
+      - name: Check the tag matches versionName
+        if: env.RELEASE_TAG != ''
+        run: |
+          VERSION_NAME=$(sed -n 's/^ *versionName *= *"\(.*\)".*/\1/p' app/build.gradle.kts)
+          if [ "v$VERSION_NAME" != "$RELEASE_TAG" ]; then
+            echo "::error::Release tag $RELEASE_TAG does not match versionName $VERSION_NAME in app/build.gradle.kts; bump versionName and versionCode first"
+            exit 1
+          fi
+
       - name: Decode release keystore
         env:
           KEYSTORE_BASE64: ${{ secrets.JOVIAL_KEYSTORE_BASE64 }}
